@@ -8,6 +8,9 @@ cimport numpy as np
 from farms_core.sensors.data_cy cimport LinkSensorArrayCy, XfrcArrayCy
 from farms_core.utils.transform cimport quat_conj, quat_mult, quat_rot
 
+# NEW: Import the pure Python buoyancy module for exact mesh-based COB
+from .buoyancy import get_buoyancy_forces
+
 
 cdef void link_swimming_info(
     LinkSensorArrayCy data_links,
@@ -23,22 +26,7 @@ cdef void link_swimming_info(
     DTYPEv1 quat_c,
     DTYPEv1 tmp4,
 ):
-    """Link swimming information
-
-    :param data_links: Links data
-    :param iteration: Simulation iteration
-    :param sensor_i: Sensor index
-    :param urdf2global: URDF to global frame transform
-    :param com2global: CoM to global frame transform
-    :param global2urdf: Global to URDF frame transform
-    :param urdf2com: Returned URDF to CoM frame transform
-    :param link_lin_velocity: Link linear velocity in URDF frame
-    :param link_ang_velocity: Link angular velocity in URDF frame
-    :param quat_c: Temporary conjugate quaternion
-    :param tmp4: Temporary quaternion
-
-    """
-
+    """Link swimming information"""
     # Orientations
     urdf2global = data_links.urdf_orientation_cy(iteration, sensor_i)
     com2global = data_links.com_orientation_cy(iteration, sensor_i)
@@ -70,15 +58,7 @@ cdef void compute_force(
     DTYPEv1 buoyancy,
     double viscosity,
 ):
-    """Compute force and torque
-
-    :param force: Returned force applied to the link in URDF frame
-    :param link_velocity: Link linear velocity in URDF frame
-    :param coefficients: Drag coefficients
-    :param buoyancy: Buoyancy force
-    :param viscosity: Fluid viscosity
-
-    """
+    """Compute force and torque"""
     cdef unsigned int i
     for i in range(3):
         force[i] = link_velocity[i]*link_velocity[i]
@@ -93,13 +73,7 @@ cdef void compute_torque(
     DTYPEv1 link_ang_velocity,
     DTYPEv1 coefficients,
 ):
-    """Compute force and torque
-
-    :param torque: Returned torque applied to the link in CoM frame
-    :param link_ang_velocity: Link angular velocity in CoM frame
-    :param coefficients: Drag coefficients
-
-    """
+    """Compute force and torque"""
     cdef unsigned int i
     for i in range(3):
         torque[i] = link_ang_velocity[i]*link_ang_velocity[i]
@@ -122,22 +96,7 @@ cdef void compute_buoyancy(
     DTYPEv1 tmp4,
     DTYPEv1 tmp,
 ):
-    """Compute buoyancy
-
-    :param density: Density of the link
-    :param water_density: Density of the surrounding fluid
-    :param height: Height of the link
-    :param position: Z position of the CoM in global frame
-    :param global2urdf: Global to URDF frame transform
-    :param mass: Mass of the link
-    :param surface: Surface height
-    :param gravity: Gravity Z component in global frame
-    :param buoyancy: Returned buoyancy force in URDF frame
-    :param quat_c: Temporary conjugate quaternion
-    :param tmp4: Temporary quaternion
-    :param tmp: Temporary quaternion
-
-    """
+    """Compute buoyancy (Old fallback method: single-point bounding-sphere ramp)"""
     if mass > 0 and position - height < surface:
         tmp[0] = 0
         tmp[1] = 0
@@ -167,41 +126,30 @@ cpdef bint drag_forces(
         double density,
         double gravity,
         bint use_buoyancy,
+        object primitives=None,
+        bint use_mesh_cob=False,
 ):
-    """Drag swimming
-
-    The forces and torques are stored into data_xfrc.array in
-    the CoM frame
-
-    :param time: Simulation time
-    :param iteration: Simulation iteration
-    :param data_links: Links data
-    :param links_index: Link data index
-    :param data_xfrc: Xfrc data
-    :param xfrc_index: Xfrc data index
-    :param coefficients: Drag coefficients
-    :param z3: Temporary array
-    :param z4: Temporary array
-    :param water: Water properties
-    :param mass: Link mass
-    :param height: Link height
-    :param density: Link density
-    :param gravity: Gravity value
-    :param use_buoyancy: Flag for using buoyancy computation
-    """
+    """Drag swimming"""
     cdef unsigned int i
     cdef double pos_x = data_links.array[iteration, links_index, 0]
     cdef double pos_y = data_links.array[iteration, links_index, 1]
     cdef double pos_z = data_links.array[iteration, links_index, 2]
     cdef double surface = water.surface(time, pos_x, pos_y)
+    
+    # if bounding sphere is completely above water, skip
     if pos_z - height > surface:
         return 0
+        
     cdef DTYPEv1 force=z3[0], torque=z3[1], buoyancy=z3[2], tmp=z3[3]
     cdef DTYPEv1 link_lin_velocity=z3[4], link_ang_velocity=z3[5]
     cdef DTYPEv1 fluid_velocity_urdf=z3[6]
     cdef DTYPEv1 urdf2global=z4[0], com2global=z4[1]
     cdef DTYPEv1 global2urdf=z4[2], urdf2com=z4[3], com2urdf=z4[4]
     cdef DTYPEv1 quat_c=z4[5], tmp4=z4[6]
+    
+    # Scratch arrays for the mesh-COB path
+    cdef DTYPEv1 pos_urdf=z3[7], com_position=z3[8]
+    cdef DTYPEv1 buoyancy_torque=z3[9]
 
     # Swimming information
     link_swimming_info(
@@ -220,21 +168,56 @@ cpdef bint drag_forces(
     )
 
     # Buoyancy forces
+    buoyancy_torque[0] = 0
+    buoyancy_torque[1] = 0
+    buoyancy_torque[2] = 0
+    
     if use_buoyancy:
-        compute_buoyancy(
-            density=density,
-            water_density=water.density(time, pos_x, pos_y, pos_z),
-            height=height,
-            position=pos_z,
-            global2urdf=global2urdf,
-            mass=mass,
-            surface=surface,
-            gravity=gravity,
-            buoyancy=buoyancy,
-            quat_c=quat_c,
-            tmp4=tmp4,
-            tmp=tmp,
-        )
+        if use_mesh_cob and primitives:
+            pos_urdf[0], pos_urdf[1], pos_urdf[2] = pos_x, pos_y, pos_z
+            com_pos_sensor = data_links.com_position_cy(iteration, links_index)
+            com_position[0] = com_pos_sensor[0]
+            com_position[1] = com_pos_sensor[1]
+            com_position[2] = com_pos_sensor[2]
+
+            # Call the pure Python buoyancy module
+            res_force, res_torque = get_buoyancy_forces(
+                use_mesh_cob=use_mesh_cob,
+                primitives=primitives,
+                pos_urdf=pos_urdf,
+                com_position=com_position,
+                urdf2global=urdf2global,
+                global2urdf=global2urdf,
+                bound_radius=height,  # 'height' is actually the bound_radius
+                mass=mass,
+                water_density=water.density(time, pos_x, pos_y, pos_z),
+                surface=surface,
+                gravity=gravity,
+                density=density
+            )
+
+            for i in range(3):
+                buoyancy[i] = res_force[i]
+                buoyancy_torque[i] = res_torque[i]
+
+            print(f"[MESH COB] Link {links_index}: Buoyancy Force Z = {buoyancy[2]:.4f} | pos_z = {pos_z:.4f}, surface = {surface:.4f}")
+
+        else:
+            # --- OLD FALLBACK METHOD (Stays in Cython for speed) ---
+            compute_buoyancy(
+                density=density,
+                water_density=water.density(time, pos_x, pos_y, pos_z),
+                height=height,
+                position=pos_z,
+                global2urdf=global2urdf,
+                mass=mass,
+                surface=surface,
+                gravity=gravity,
+                buoyancy=buoyancy,
+                quat_c=quat_c,
+                tmp4=tmp4,
+                tmp=tmp,
+            )
 
     # Add fluid velocity
     quat_rot(
@@ -261,6 +244,10 @@ cpdef bint drag_forces(
         link_ang_velocity=link_ang_velocity,
         coefficients=coefficients[1],
     )
+    
+    # Add buoyancy torque to total torque
+    for i in range(3):
+        torque[i] += buoyancy_torque[i]
 
     # Drag forces in inertial frame
     quat_rot(force, urdf2com, quat_c, tmp4, force)
@@ -275,30 +262,24 @@ cpdef bint drag_forces(
 
 cdef class WaterProperties:
     """Water properties"""
-
     def __init__(self):
         super(WaterProperties, self).__init__()
 
-    cdef double surface(self, double t, double x, double y):  # nogil
-        """Surface"""
+    cdef double surface(self, double t, double x, double y):
         return 0
 
-    cdef double density(self, double t, double x, double y, double z):  # nogil
-        """Density"""
+    cdef double density(self, double t, double x, double y, double z):
         return 1000
 
-    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):  # nogil
-        """Velocity in global frame"""
+    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
         return np.array([0, 0, 0])
 
-    cdef double viscosity(self, double t, double x, double y, double z):  # nogil
-        """Viscosity"""
+    cdef double viscosity(self, double t, double x, double y, double z):
         return 1.0
 
 
 cdef class WaterPropertiesConstant(WaterProperties):
     """Water properties"""
-
     cdef double _surface
     cdef double _density
     cdef double _viscosity
@@ -312,23 +293,18 @@ cdef class WaterPropertiesConstant(WaterProperties):
         self._viscosity = viscosity
 
     cdef double surface(self, double t, double x, double y):
-        """Surface"""
         return self._surface
 
     cdef double density(self, double t, double x, double y, double z):
-        """Density"""
         return self._density
 
     cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
-        """Velocity in global frame"""
         return self._velocity
 
     cdef double viscosity(self, double t, double x, double y, double z):
-        """Viscosity"""
         return self._viscosity
 
     cpdef void set_velocity(self, double t, double vx, double vy, double vz):
-        """Set velocity"""
         self._velocity[0] = vx
         self._velocity[1] = vy
         self._velocity[2] = vz
@@ -336,7 +312,6 @@ cdef class WaterPropertiesConstant(WaterProperties):
 
 cdef class WaterPropertiesExtension(WaterProperties):
     """Water properties"""
-
     cdef object _surface
     cdef object _density
     cdef object _viscosity
@@ -349,26 +324,21 @@ cdef class WaterPropertiesExtension(WaterProperties):
         self._velocity = velocity
         self._viscosity = viscosity
 
-    cdef double surface(self, double t, double x, double y):  # nogil
-        """Surface"""
+    cdef double surface(self, double t, double x, double y):
         return self._surface(t, x, y)
 
-    cdef double density(self, double t, double x, double y, double z):  # nogil
-        """Density"""
+    cdef double density(self, double t, double x, double y, double z):
         return self._density(t, x, y, z)
 
-    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):  # nogil
-        """Velocity in global frame"""
+    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
         return self._velocity(t, x, y, z)
 
-    cdef double viscosity(self, double t, double x, double y, double z):  # nogil
-        """Viscosity"""
+    cdef double viscosity(self, double t, double x, double y, double z):
         return self._viscosity(t, x, y, z)
 
 
 cdef class SwimmingHandler:
     """Swimming handler"""
-
     cdef object links
     cdef object xfrc
     cdef object animat_options
@@ -376,6 +346,8 @@ cdef class SwimmingHandler:
     cdef bint drag
     cdef bint sph
     cdef bint buoyancy
+    cdef bint use_mesh_cob       # NEW
+    cdef object link_primitives  # NEW
     cdef WaterProperties water
     cdef double meters
     cdef double newtons
@@ -408,8 +380,16 @@ cdef class SwimmingHandler:
             velocity=np.array(water_options.velocity, dtype=float),
             viscosity=float(water_options.viscosity),
         ) if water is None else water
-        self.z3 = np.zeros([7, 3])
+        
+        # Increased z3 size to accommodate the new mesh-COB scratch arrays
+        self.z3 = np.zeros([11, 3])
         self.z4 = np.zeros([7, 4])
+        
+        # self.use_mesh_cob = (
+        #     getattr(water_options, 'buoyancy_method', 'analytic') == 'mesh'
+        # )
+        self.use_mesh_cob = True
+        
         links = [
             link
             for link in self.animat_options.morphology.links
@@ -421,15 +401,19 @@ cdef class SwimmingHandler:
             physics.model.body_mass[links_row.convert_key_item(prefix+link.name)]
             for link in links
         ], dtype=float)/units.kilograms
+        
         self.heights = np.array([
             [
                 0.5*physics.model.geom_rbound[geom_i]
                 for geom_i in range(len(physics.model.geom_bodyid))
                 if links_row.names[physics.named.model.geom_bodyid[geom_i]]
                 == prefix+link.name
+                # Only collision geoms are physically meaningful here
+                and physics.model.geom_group[geom_i] == 2
             ][0]
             for link in links
         ], dtype=float)/self.meters
+        
         self.densities = np.array([link.density for link in links])
         self.xfrc_indices = np.array([
             self.xfrc.names.index(link.name)
@@ -443,6 +427,22 @@ cdef class SwimmingHandler:
             np.array(link.drag_coefficients)
             for link in links
         ])
+        
+        #Per-link collision-primitive caches for the mesh COB method.
+        if self.use_mesh_cob:
+            from .geom_utils import gather_link_collision_primitives
+            self.link_primitives = [
+                gather_link_collision_primitives(
+                    physics=physics,
+                    link_name=link.name,
+                    prefix=prefix,
+                    meters=self.meters,
+                )
+                for link in links
+            ]
+        else:
+            self.link_primitives = [None]*self.n_links
+            
         if self.sph:
             self.water._surface = 1e8
 
@@ -469,6 +469,8 @@ cdef class SwimmingHandler:
                         density=self.densities[i],
                         gravity=-9.81,
                         use_buoyancy=self.buoyancy,
+                        primitives=self.link_primitives[i], 
+                        use_mesh_cob=self.use_mesh_cob,
                     )
 
     cpdef set_frame(self, int frame):
