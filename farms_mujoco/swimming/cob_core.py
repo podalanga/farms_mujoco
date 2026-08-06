@@ -147,20 +147,16 @@ def submerged_volume_and_centroid_fast(cache, world_pos, world_rot, water_z):
     world_pos = np.asarray(world_pos, dtype=float)
     centroid_world = world_rot @ cache.centroid_local + world_pos
 
-    #extra added for testing
- # Straddles the water plane -- fall back to the exact per-triangle clip.
+
+    depth = water_z - centroid_world[2]
+    if depth < -cache.bound_radius:
+        return 0.0, centroid_world
+    if depth > cache.bound_radius:
+        return cache.volume, centroid_world
+
+    # Straddles the water plane -- fall back to the exact per-triangle clip.
     verts_world = cache.verts_local @ world_rot.T + world_pos
     return submerged_volume_and_centroid(verts_world, cache.faces, water_z)
-
-    # depth = water_z - centroid_world[2]
-    # if depth < -cache.bound_radius:
-    #     return 0.0, centroid_world
-    # if depth > cache.bound_radius:
-    #     return cache.volume, centroid_world
-
-    # # Straddles the water plane -- fall back to the exact per-triangle clip.
-    # verts_world = cache.verts_local @ world_rot.T + world_pos
-    # return submerged_volume_and_centroid(verts_world, cache.faces, water_z)
 
 
 def buoyancy_force(volume, rho_fluid, g=9.81):

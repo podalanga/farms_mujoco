@@ -28,8 +28,8 @@ cdef void link_swimming_info(
 ):
     """Link swimming information"""
     # Orientations
-    urdf2global = data_links.urdf_orientation_cy(iteration, sensor_i)
-    com2global = data_links.com_orientation_cy(iteration, sensor_i)
+    urdf2global[:] = data_links.urdf_orientation_cy(iteration, sensor_i)
+    com2global[:] = data_links.com_orientation_cy(iteration, sensor_i)
     quat_conj(urdf2global, global2urdf)
     quat_mult(global2urdf, com2global, com2urdf)
     quat_conj(com2urdf, urdf2com)
@@ -200,7 +200,7 @@ cpdef bint drag_forces(
                 buoyancy[i] = res_force[i]
                 buoyancy_torque[i] = res_torque[i]
 
-            print(f"[MESH COB] Link {links_index}: Buoyancy Force Z = {buoyancy[2]:.4f} | pos_z = {pos_z:.4f}, surface = {surface:.4f}")
+            # print(f"[MESH COB] Link {links_index}: Buoyancy Force Z = {buoyancy[2]:.4f} | pos_z = {pos_z:.4f}, surface = {surface:.4f}")
 
         else:
             # --- OLD FALLBACK METHOD (Stays in Cython for speed) ---
@@ -239,6 +239,8 @@ cpdef bint drag_forces(
         buoyancy=buoyancy,
         viscosity=water.viscosity(time, pos_x, pos_y, pos_z),
     )
+    # print(f"[AFTER COMBINE] force={force[0]:.4f},{force[1]:.4f},{force[2]:.4f}") 
+
     compute_torque(
         torque=torque,
         link_ang_velocity=link_ang_velocity,
@@ -249,9 +251,11 @@ cpdef bint drag_forces(
     for i in range(3):
         torque[i] += buoyancy_torque[i]
 
-    # Drag forces in inertial frame
-    quat_rot(force, urdf2com, quat_c, tmp4, force)
-    quat_rot(torque, urdf2com, quat_c, tmp4, torque)
+    # Drag forces in inertial world frame
+    quat_rot(force, urdf2global, quat_c, tmp4, force)
+    quat_rot(torque, urdf2global, quat_c, tmp4, torque)
+
+    # print(f"[XFRC WRITE] link={links_index} xfrc_idx={xfrc_index} force={force[0]:.4f},{force[1]:.4f},{force[2]:.4f}")
 
     # Store data
     for i in range(3):
@@ -450,9 +454,11 @@ cdef class SwimmingHandler:
         """Swimming step"""
         cdef unsigned int i
         cdef bint apply_force = 1
-        if self.drag or self.sph:
+        if self.drag or self.sph or self.buoyancy:
             for i in range(self.n_links):
-                if self.drag:
+                if self.drag or self.buoyancy:
+
+                    # print(i, self.links_indices[i], self.xfrc_indices[i], self.xfrc.names[self.xfrc_indices[i]], self.links.names[self.links_indices[i]])
                     apply_force = drag_forces(
                         time=time,
                         iteration=iteration,
