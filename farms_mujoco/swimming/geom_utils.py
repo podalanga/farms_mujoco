@@ -63,9 +63,15 @@ def _wxyz_to_xyzw(q_wxyz):
     return np.array([x, y, z, w], dtype=float)
 
 
-def gather_link_collision_primitives(physics, link_name, prefix='', meters=1.0):
+def gather_link_collision_primitives(physics, link_name, prefix='', meters=1.0, mesh_resolution=None):
     """Build cached primitive meshes for every collision geom (group==2)
     attached to a given link/body, in that link's own frame.
+
+    `mesh_resolution`: optional primitive_meshes.MeshResolution
+    controlling tessellation density for the mesh-clip fallback path
+    (irrelevant for shapes handled by a closed form -- currently
+    spheres -- unless cob_method='mesh' forces the mesh path for them
+    too). Defaults to primitive_meshes.DEFAULT_MESH_RESOLUTION if None.
 
     Returns
     -------
@@ -129,7 +135,7 @@ def gather_link_collision_primitives(physics, link_name, prefix='', meters=1.0):
         else:  # capsule, cylinder
             size = size[:2]
 
-        cache = build_primitive_cache(type_name, size)
+        cache = build_primitive_cache(type_name, size, mesh_resolution)
 
         offset_pos = np.asarray(geom_pos[geom_i], dtype=float) / meters
         offset_quat = _wxyz_to_xyzw(geom_quat[geom_i])

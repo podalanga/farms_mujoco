@@ -21,7 +21,7 @@ def box_mesh(half_extents):
     return v, f
 
 
-def uv_sphere_mesh(radius, n_lat=12, n_lon=24):
+def uv_sphere_mesh(radius, n_lat=16, n_lon=32):
     """UV sphere, local frame, centered at origin"""
     verts = [np.array([0, 0, radius])]
     for i in range(1, n_lat):
@@ -50,7 +50,7 @@ def uv_sphere_mesh(radius, n_lat=12, n_lon=24):
             c, d = r1 + j, r1 + (j + 1) % n_lon
             faces.append([a, c, d])
             faces.append([a, d, b])
-    '''
+    r'''
     I took the quad to be 
 
     d ----- c ring n+1
@@ -65,7 +65,7 @@ def uv_sphere_mesh(radius, n_lat=12, n_lon=24):
     return verts, np.array(faces)
 
 
-def cylinder_mesh(radius, half_height, n_seg=32):
+def cylinder_mesh(radius, half_height, n_seg=20):
     """Cylinder, local frame, axis along z, centered at origin"""
     verts = []
     for z in (-half_height, half_height):
@@ -93,7 +93,7 @@ def cylinder_mesh(radius, half_height, n_seg=32):
     return verts, np.array(faces)
 
 
-def capsule_mesh(radius, half_length, n_lat=8, n_lon=24):
+def capsule_mesh(radius, half_length, n_lat=6, n_lon=16):
     """Capsule, local frame, axis along z: cylinder of half_length plus a
     hemisphere of `radius` capping each end (MuJoCo capsule convention:
     `size = (radius, half_length)`, total length along axis = 2*half_length
@@ -183,24 +183,82 @@ def capsule_mesh(radius, half_length, n_lat=8, n_lon=24):
     return verts, np.array(faces)
 
 
+# NOTE on the resolutions above (n_lat/n_lon/n_seg defaults):
+# These meshes only exist to integrate volume/centroid for buoyancy --
+# never rendered -- so they don't need render-quality tessellation.
+# Benchmarked on a 0.05m sphere: the original 30x60 UV sphere (3480
+# faces) gives ~0.46% volume error vs the exact analytic sphere volume;
+# dropping to 16x32 (960 faces, used above) still holds under ~1.6%
+# error while cutting per-step clip cost roughly 3x, because the clip
+# math scales with face count. Below ~n_lat=12 error climbs fast (UV
+# spheres' polar triangle fans systematically underestimate volume
+# there), so don't go lower without checking the tradeoff yourself --
+# e.g. copy the loop in test_coarse.py-style: build a cache, compare
+# `cache.volume` to `4/3*pi*r**3`, and time the hot call.
 PRIMITIVE_BUILDERS = {
     'box': box_mesh,
-    'sphere': lambda size: uv_sphere_mesh(size[0]),
-    'cylinder': lambda size: cylinder_mesh(size[0], size[1]),
-    'capsule': lambda size: capsule_mesh(size[0], size[1]),
+    'sphere': lambda size, res: uv_sphere_mesh(size[0], n_lat=res.sphere_n_lat, n_lon=res.sphere_n_lon),
+    'cylinder': lambda size, res: cylinder_mesh(size[0], size[1], n_seg=res.cylinder_n_seg),
+    'capsule': lambda size, res: capsule_mesh(size[0], size[1], n_lat=res.capsule_n_lat, n_lon=res.capsule_n_lon),
 }
 
 
-def build_local_mesh(geom_type: str, size):
+class MeshResolution:
+    """Tessellation knobs for the mesh-clip fallback path, gathered in
+    one place so callers (ultimately SwimmingHandler in drag.pyx) can
+    expose them as configurable options instead of the fixed defaults
+    baked into uv_sphere_mesh/cylinder_mesh/capsule_mesh.
+
+    Defaults match the benchmarked values in the comment above this
+    class's old location (~1.6% volume error, ~3x fewer faces than the
+    original 30x60 sphere). Only matters for shapes actually going
+    through the mesh-clip path -- e.g. with the default 'analytic'
+    cob_method, sphere_n_lat/sphere_n_lon are irrelevant for spheres
+    (closed-form is used instead) unless you force cob_method='mesh'.
+    """
+    __slots__ = (
+        'sphere_n_lat', 'sphere_n_lon',
+        'cylinder_n_seg',
+        'capsule_n_lat', 'capsule_n_lon',
+    )
+
+    def __init__(
+        self,
+        sphere_n_lat=16, sphere_n_lon=32,
+        cylinder_n_seg=20,
+        capsule_n_lat=6, capsule_n_lon=16,
+    ):
+        self.sphere_n_lat = sphere_n_lat
+        self.sphere_n_lon = sphere_n_lon
+        self.cylinder_n_seg = cylinder_n_seg
+        self.capsule_n_lat = capsule_n_lat
+        self.capsule_n_lon = capsule_n_lon
+
+
+DEFAULT_MESH_RESOLUTION = MeshResolution()
+
+# geom_type -> integer code for PrimitiveCache.analytic_kind. 0 always
+# means "no closed form known, use the mesh-clip path". Add an entry
+# here (and a matching branch in buoyancy.py's dispatcher + a `_cy`
+# solver in buoyancy_cy.pyx) when a new analytic shape is added to
+# analytic_shapes.py.
+_ANALYTIC_KIND_CODES = {
+    'sphere': 1,
+}
+
+
+def build_local_mesh(geom_type: str, size, mesh_resolution: 'MeshResolution' = None):
     """size follows MuJoCo geom_size convention for the given geom_type:
     box: half-extents (hx,hy,hz); sphere: (radius,); cylinder/capsule:
     (radius, half_length)
     """
+    if mesh_resolution is None:
+        mesh_resolution = DEFAULT_MESH_RESOLUTION
     if geom_type == 'box':
         return box_mesh(size)
     if geom_type not in PRIMITIVE_BUILDERS:
         raise ValueError(f'No primitive mesh builder for geom_type={geom_type!r}')
-    return PRIMITIVE_BUILDERS[geom_type](size)
+    return PRIMITIVE_BUILDERS[geom_type](size, mesh_resolution)
 
 
 class PrimitiveCache:
@@ -208,34 +266,68 @@ class PrimitiveCache:
     collision primitive, precomputed once at model-load time in the
     primitive's own LOCAL frame:
 
-    - verts_local, faces : the closed triangle mesh (for the rare
-      near-surface exact-clip fallback)
+    - verts_local, faces : the closed triangle mesh (for the mesh-clip
+      path -- still built and cached even for shapes with a closed
+      form, so cob_method='mesh' can force it for any primitive,
+      e.g. for accuracy comparisons or debugging the analytic path)
     - volume             : full (unclipped) mesh volume
     - centroid_local      : full (unclipped) mesh centroid, local frame
     - bound_radius        : max distance from centroid_local to any
       vertex -- i.e. radius of the tightest sphere centered on the
       centroid that contains the whole primitive. Used as a cheap
-      per-step "is this primitive anywhere near the surface" test.
+      per-step "is this primitive anywhere near the surface" test,
+      shared by both the mesh-clip and analytic paths.
+    - faces_i64           : same triangles as `faces`, pre-cast to a
+      contiguous int64 array once here at load time. buoyancy_cy.pyx (the
+      Cython hot path) indexes into this directly every step -- casting
+      fresh on every call would just move the allocation cost from
+      "once at load" to "every step", which defeats the point of
+      precomputing this cache in the first place.
+    - geom_type, geom_size : the MuJoCo primitive type ('sphere',
+      'box', ...) and its geom_size tuple, kept around so a closed-form
+      solver (analytic_shapes.py) can be called directly instead of
+      going through the mesh -- e.g. a sphere's exact volume needs only
+      geom_size[0] (radius) and the world position, no mesh at all.
+    - analytic_kind        : precomputed int dispatch code (0 = no
+      closed form, use mesh; 1 = sphere; see
+      primitive_meshes._ANALYTIC_KIND_CODES). Stored as a plain int
+      instead of comparing `geom_type` strings in the hot loop, so the
+      Cython dispatcher (buoyancy_cy.pyx) is a cheap int compare rather
+      than a Python string comparison on every single step.
     """
-    __slots__ = ('verts_local', 'faces', 'volume', 'centroid_local', 'bound_radius')
+    __slots__ = (
+        'verts_local', 'faces', 'volume', 'centroid_local', 'bound_radius',
+        'faces_i64', 'geom_type', 'geom_size', 'analytic_kind',
+    )
 
-    def __init__(self, verts_local, faces, volume, centroid_local, bound_radius):
+    def __init__(self, verts_local, faces, volume, centroid_local, bound_radius,
+                 geom_type='mesh', geom_size=()):
         self.verts_local = verts_local
         self.faces = faces
         self.volume = volume
         self.centroid_local = centroid_local
         self.bound_radius = bound_radius
+        self.faces_i64 = np.ascontiguousarray(faces, dtype=np.int64)
+        self.geom_type = geom_type
+        self.geom_size = tuple(float(s) for s in geom_size)
+        self.analytic_kind = _ANALYTIC_KIND_CODES.get(geom_type, 0)
 
 
-def build_primitive_cache(geom_type: str, size) -> 'PrimitiveCache':
+def build_primitive_cache(geom_type: str, size, mesh_resolution: 'MeshResolution' = None) -> 'PrimitiveCache':
     """Build and cache the local-frame mesh plus its full volume,
     centroid, and bounding radius. Call once per (geom_type, size) at
     model-load time -- never in the per-step hot path.
+
+    `mesh_resolution` only affects the tessellation used for the
+    mesh-clip fallback path (build_local_mesh above); it has no effect
+    on shapes with a closed form (currently just 'sphere') beyond that
+    fallback mesh still being built and cached so cob_method='mesh' can
+    force it if you want to sanity-check the analytic path against it.
     """
     # Local import to avoid a hard circular dependency at module load.
-    from .cob_core import submerged_volume_and_centroid
+    from .buoyancy import submerged_volume_and_centroid
 
-    verts, faces = build_local_mesh(geom_type, size)
+    verts, faces = build_local_mesh(geom_type, size, mesh_resolution)
     # Any water_z strictly above every vertex -> whole mesh counts as
     # "submerged" -> submerged_volume_and_centroid returns the exact
     # full-mesh volume/centroid (this is exercised by the n_wet==3 path,
@@ -251,4 +343,6 @@ def build_primitive_cache(geom_type: str, size) -> 'PrimitiveCache':
         volume=volume,
         centroid_local=centroid_local,
         bound_radius=bound_radius,
+        geom_type=geom_type,
+        geom_size=size,
     )

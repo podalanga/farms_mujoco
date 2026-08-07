@@ -11,9 +11,9 @@ from farms_core.model.data import AnimatData
 from farms_core.model.options import AnimatOptions, ArenaOptions
 from farms_core.experiment.options import ExperimentOptions
 from farms_core.model.extensions import AnimatExtension
-from farms_mujoco.swimming.drag import SwimmingHandler
+from farms_mujoco.swimming.hydrodynamics import SwimmingHandler
 from farms_mujoco.simulation.mjcf import get_prefix
-from farms_mujoco.swimming.drag import WaterPropertiesExtension
+from farms_mujoco.swimming.hydrodynamics import WaterPropertiesExtension
 
 
 def water_velocity_from_maps(position, water_maps):
