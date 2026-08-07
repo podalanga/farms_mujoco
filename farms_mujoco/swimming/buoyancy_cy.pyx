@@ -224,12 +224,26 @@ def submerged_volume_and_centroid_fast_cy(
     cdef np.ndarray[DTYPE_t, ndim=1] depths = water_z - verts_world[:, 2]
 
     cdef double apex_x = 0.0, apex_y = 0.0
+    cdef int n_wet_verts = 0
     cdef Py_ssize_t vi
     for vi in range(n_verts):
-        apex_x += verts_world[vi, 0]
-        apex_y += verts_world[vi, 1]
-    apex_x /= n_verts
-    apex_y /= n_verts
+        if depths[vi] >= 0.0:
+            apex_x += verts_world[vi, 0]
+            apex_y += verts_world[vi, 1]
+            n_wet_verts += 1
+    if n_wet_verts > 0:
+        apex_x /= n_wet_verts
+        apex_y /= n_wet_verts
+    else:
+        # No individually-wet vertex even though centroid depth was inside
+        # the bound-radius band (grazing-corner case) -- total_vol will
+        # come out ~0 regardless; fall back to all-vertex mean so we don't
+        # divide by zero.
+        for vi in range(n_verts):
+            apex_x += verts_world[vi, 0]
+            apex_y += verts_world[vi, 1]
+        apex_x /= n_verts
+        apex_y /= n_verts
     cdef double apex_z = water_z
 
     cdef Py_ssize_t n_faces = faces.shape[0]

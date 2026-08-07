@@ -140,8 +140,11 @@ def submerged_volume_and_centroid(vertices_world, faces, water_z, plane_point=No
         return 0.0, vertices_world.mean(axis=0)
 
     if plane_point is None:
-        mean_xy = vertices_world[:, :2].mean(axis=0)
+        wet_verts = vertices_world[depths >= 0.0]
+        xy_source = wet_verts if len(wet_verts) > 0 else vertices_world
+        mean_xy = xy_source[:, :2].mean(axis=0)
         plane_point = np.array([mean_xy[0], mean_xy[1], water_z])
+
     apex = np.asarray(plane_point, dtype=float)
 
     tri_verts = vertices_world[faces]        # (M, 3, 3)
@@ -216,6 +219,9 @@ def _cross_point(vi, vj, di, dj):
     return vi + t[:, None] * (vj - vi)
 
 
+_fast_cy = None  # cache for the lazily-imported buoyancy_cy function, set on first call
+
+
 def submerged_volume_and_centroid_fast(cache, world_pos, world_rot, water_z, force_mesh=False):
     """Per-primitive, per-step submerged volume/centroid -- the function
     compute_buoyancy_mesh below actually calls in the hot loop. Thin
@@ -240,10 +246,19 @@ def submerged_volume_and_centroid_fast(cache, world_pos, world_rot, water_z, for
     `force_mesh=True` forces the mesh-clip loop even for shapes with a
     closed form -- e.g. to sanity-check the analytic path against the
     mesh path.
+
+    The import itself is cached in `_fast_cy` (module-level, resolved
+    once on first call) rather than re-imported every call: the
+    circular-import hazard is only at module-init time, so a
+    sys.modules lookup + attribute bind on every primitive, every step
+    was pure waste once the module graph has finished loading.
     """
-    from .buoyancy_cy import submerged_volume_and_centroid_fast_cy
+    global _fast_cy
+    if _fast_cy is None:
+        from .buoyancy_cy import submerged_volume_and_centroid_fast_cy
+        _fast_cy = submerged_volume_and_centroid_fast_cy
     world_pos = np.asarray(world_pos, dtype=float)
-    return submerged_volume_and_centroid_fast_cy(cache, world_pos, world_rot, water_z, force_mesh)
+    return _fast_cy(cache, world_pos, world_rot, water_z, force_mesh)
 
 
 def buoyancy_force(volume, rho_fluid, g=9.81):

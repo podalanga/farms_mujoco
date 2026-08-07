@@ -436,7 +436,7 @@ cdef class SwimmingHandler:
 
         self.bound_radii = np.array([
             [
-                0.5*physics.model.geom_rbound[geom_i]
+                physics.model.geom_rbound[geom_i]  # already a radius, not a diameter -- do not halve
                 for geom_i in range(len(physics.model.geom_bodyid))
                 if links_row.names[physics.named.model.geom_bodyid[geom_i]]
                 == prefix+link.name
