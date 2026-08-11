@@ -435,13 +435,14 @@ cdef class SwimmingHandler:
         ], dtype=float)/units.kilograms
 
         self.bound_radii = np.array([
-            [
-                physics.model.geom_rbound[geom_i]  # already a radius, not a diameter -- do not halve
+            max(
+                float(np.linalg.norm(physics.model.geom_pos[geom_i]))
+                + physics.model.geom_rbound[geom_i]  # already a radius, not a diameter -- do not halve
                 for geom_i in range(len(physics.model.geom_bodyid))
                 if links_row.names[physics.named.model.geom_bodyid[geom_i]]
                 == prefix+link.name
                 and physics.model.geom_group[geom_i] == 2
-            ][0]
+            )
             for link in links
         ], dtype=float)/self.meters
 

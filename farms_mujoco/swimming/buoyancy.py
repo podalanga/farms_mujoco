@@ -42,6 +42,8 @@ from __future__ import annotations
 import numpy as np
 
 _EPS = 1e-12
+DEBUG_BUOYANCY = True
+MIN_SUBMERGED_VOLUME = 1e-8 
 
 # buoyancy_cy.pyx (compiled to buoyancy_cy.*.so) is a HARD dependency for
 # the per-step hot path, not an optional accelerator. There used to be a
@@ -332,7 +334,7 @@ def compute_buoyancy_mesh(primitives, pos_urdf, com_position, urdf2global, globa
         cwy += vol_i * centroid_i[1]
         cwz += vol_i * centroid_i[2]
 
-    if v_total <= 0.0:
+    if v_total <= MIN_SUBMERGED_VOLUME:
         return np.zeros(3), np.zeros(3)
 
     # Center of Buoyancy (World Frame)
@@ -378,10 +380,32 @@ def compute_link_buoyancy(force_mesh, primitives, pos_urdf, com_position, urdf2g
     already existed, it computes buoyancy from scratch every call.
     """
     if primitives:
-        return compute_buoyancy_mesh(
-            primitives, pos_urdf, com_position, urdf2global, global2urdf,
-            water_density, surface, gravity, force_mesh=force_mesh,
+        force_urdf, torque_urdf = compute_buoyancy_mesh(
+            primitives,
+            pos_urdf,
+            com_position,
+            urdf2global,
+            global2urdf,
+            water_density,
+            surface,
+            gravity,
+            force_mesh=force_mesh,
         )
+
+        if DEBUG_BUOYANCY:
+            force_z = force_urdf[2]
+
+            print(
+                f"[BUOYANCY] "
+                f"mass={mass:.6f} kg | "
+                f"density={density:.2f} kg/m^3 | "
+                f"volume={-force_z / (water_density * gravity):.8e} m^3 | "
+                f"Fz_urdf={force_z:.6f} N | "
+                f"weight={mass * gravity:.6f} N | "
+                f"torque={torque_urdf}"
+            )
+
+        return force_urdf, torque_urdf
     else:
         return compute_buoyancy_analytic(
             bound_radius, pos_urdf[2], global2urdf, mass, water_density, surface, gravity, density
