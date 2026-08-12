@@ -46,4 +46,7 @@ cdef void compute_link_buoyancy_fast(
     DTYPEv1 quat_c,
     DTYPEv1 tmp4,
     DTYPEv1 tmp,
+    bint use_interp_fast=*,
+    int interp_steps=*,
+    object interp_state=*,
 ) except *

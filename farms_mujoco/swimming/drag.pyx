@@ -1,25 +1,4 @@
-"""drag.pyx -- drag physics only.
-
-Split out of what used to be a single drag.pyx containing drag,
-buoyancy, and orchestration all together. Now:
-  - drag.pyx          (this file) -- drag force/torque, nothing else
-  - buoyancy_cy.pyx    -- buoyancy force/torque, nothing else (note the
-                          `_cy` suffix: buoyancy.py already exists as
-                          the pure-Python exact-method module, and a
-                          compiled `buoyancy.pyx` would produce a
-                          module literally named `buoyancy`, colliding
-                          with it in the same package -- see that
-                          file's docstring)
-  - hydrodynamics.pyx  -- orchestration: combines drag + buoyancy per
-                          link, water property classes, SwimmingHandler
-
-This file has no knowledge of buoyancy, sensors, or water surfaces --
-it only knows "given a relative velocity and some coefficients, what's
-the drag force/torque". `compute_link_drag_fast` is the one entry point
-hydrodynamics.pyx calls; it does the fluid-relative-velocity rotation
-that used to live inline in compute_link_forces, then calls the two
-pure force/torque functions below.
-"""
+"""drag.pyx -- drag physics only."""
 
 from farms_core.utils.transform cimport quat_rot
 

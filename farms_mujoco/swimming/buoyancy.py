@@ -3,38 +3,6 @@ force does this volume of displaced water produce" (the original
 content of this file) and "how much of this primitive is submerged in
 the first place" (formerly cob_core.py, i.e. the center-of-buoyancy /
 submerged-volume-and-centroid math).
-
-These two used to be separate files because they grew at different
-times, not because they're doing logically different jobs -- both are
-"buoyancy math", just at different levels (per-primitive submerged
-volume vs. force/torque from that volume). Merged here so there's one
-place to read/edit buoyancy physics instead of two.
-
-Compiled Cython twin: buoyancy_cy.pyx (module `buoyancy_cy`, not
-`buoyancy.pyx` -- see that file's docstring for why the `_cy` suffix
-is load-bearing: a compiled `buoyancy.pyx` would produce a module
-literally named `buoyancy`, colliding with this file in the same
-package). buoyancy_cy.pyx is the hard-required hot path for the exact
-'mesh'/'analytic' cob methods; this file is no longer wired into the
-per-step loop for that math (see submerged_volume_and_centroid_fast
-below), but IS still called every step for the 'ramp' vs 'exact'
-buoyancy-force combination via compute_link_buoyancy -- see that
-function's docstring.
-
-NOTE on the import below: buoyancy_cy.pyx imports compute_link_buoyancy
-from THIS module at its own top level (it has to -- that's where the
-mesh/analytic per-primitive dispatch lives). So this module cannot also
-import buoyancy_cy at the top level, or the two would import each other
-mid-initialization. submerged_volume_and_centroid_fast_cy is therefore
-imported lazily, inside submerged_volume_and_centroid_fast, the one
-place it's used -- by the time that function is actually called, both
-modules have finished loading.
-
-Closed-form per-shape solvers (currently just the sphere) live in
-their own file, analytic_shapes.py, and stay separate from this one:
-that file is deliberately a readable derivation/reference + validation
-target for buoyancy_cy's typed twin, not runtime-dispatched code, so
-mixing it into this file would blur that distinction.
 """
 
 from __future__ import annotations
@@ -42,34 +10,8 @@ from __future__ import annotations
 import numpy as np
 
 _EPS = 1e-12
-DEBUG_BUOYANCY = True
+DEBUG_BUOYANCY = False
 MIN_SUBMERGED_VOLUME = 1e-8 
-
-# buoyancy_cy.pyx (compiled to buoyancy_cy.*.so) is a HARD dependency for
-# the per-step hot path, not an optional accelerator. There used to be a
-# try/except ImportError here that silently dropped into a pure-NumPy
-# reimplementation of the same clip math (plus a separate ANALYTIC_SOLVERS
-# dispatch for the analytic-sphere shortcut) whenever the extension
-# wasn't built. That meant two independently-maintained copies of the
-# same algorithm that could quietly drift apart -- or silently run 20x
-# slower -- with no signal beyond "the .so happened to be missing".
-# That's exactly the shape of bug that's expensive to track down (see
-# the recent link_swimming_info memoryview issue). If buoyancy_cy isn't
-# built, this now fails loudly -- the first call to
-# submerged_volume_and_centroid_fast raises ImportError -- build it with
-# `python setup_hydrodynamics.py build_ext --inplace` -- instead of
-# degrading silently. (It can't fail at THIS module's import time
-# anymore, since the import is now lazy for the circular-import reason
-# above -- but it still fails loudly, just on first use instead of on
-# import.)
-#
-# submerged_volume_and_centroid below (the vectorized NumPy clip) is NOT
-# part of that removed fallback -- it's kept because
-# primitive_meshes.build_primitive_cache calls it exactly once per
-# (geom_type, size) at model-load time, to get each primitive's full
-# unclipped volume/centroid. That's a one-off setup call, not the hot
-# loop, so plain NumPy is fine there and there's no Cython twin of it to
-# keep in sync.
 
 
 # --- Helper Math Functions (Pure NumPy to avoid farms_core Python/Cython API quirks) ---
@@ -96,8 +38,6 @@ def _quat_mult_xyzw(q1, q2):
 
 
 # --- Submerged volume/centroid ("center of buoyancy") math ---
-# Formerly cob_core.py -- see the module docstring above for why it's
-# here now.
 
 def _tet_vol_and_wcentroid(apex, a, b, c):
     """Vectorized signed volume*6 and volume-weighted centroid for a batch

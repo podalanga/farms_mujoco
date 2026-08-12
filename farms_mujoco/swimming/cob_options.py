@@ -12,7 +12,8 @@ matches how the rest of your config is organized:
    buoyancy style):
 
      water:
-       cob_method: analytic
+       cob_method: analytic_fast
+       cob_interp_steps: 20
        cob_sphere_n_lat: 16
        cob_sphere_n_lon: 32
        cob_cylinder_n_seg: 20
@@ -25,7 +26,8 @@ matches how the rest of your config is organized:
 
      water:
        cob:
-         method: analytic       # 'ramp' | 'mesh' | 'analytic'
+         method: analytic_fast  # 'ramp' | 'mesh' | 'analytic' | 'analytic_fast'
+         interp_steps: 20       # steps between full recomputations (analytic_fast only)
          sphere: {n_lat: 16, n_lon: 32}
          cylinder: {n_seg: 20}
          capsule: {n_lat: 6, n_lon: 16}
@@ -37,25 +39,43 @@ matches how the rest of your config is organized:
    uses.
 
 method options:
-  - 'ramp'     : old single-point bounding-sphere linear ramp. Fast,
-                 approximate, no collision primitives needed.
-  - 'mesh'     : exact per-primitive submerged volume via triangle-mesh
-                 clipping ("tetrahedron method"), for every primitive
-                 regardless of shape.
-  - 'analytic' (default): exact per-primitive submerged volume, using a
-                 closed-form solution where one is known (currently
-                 spheres -- O(1), no tessellation error at all -- see
-                 analytic_shapes.py) and mesh-clip otherwise. Strictly
-                 better than 'mesh' for any scene that includes
-                 spheres.
+  - 'ramp'          : old single-point bounding-sphere linear ramp. Fast,
+                      approximate, no collision primitives needed.
+  - 'mesh'          : exact per-primitive submerged volume via triangle-mesh
+                      clipping ("tetrahedron method"), for every primitive
+                      regardless of shape.
+  - 'analytic'      (default): exact per-primitive submerged volume, using a
+                      closed-form solution where one is known (currently
+                      spheres -- O(1), no tessellation error at all -- see
+                      analytic_shapes.py) and mesh-clip otherwise. Strictly
+                      better than 'mesh' for any scene that includes
+                      spheres.
+  - 'analytic_fast' : same as 'analytic' but skips the full computation on
+                      most steps. Every `interp_steps` simulation steps the
+                      exact CoB and submerged volume are recomputed for each
+                      link (the "anchor" step). In between, both quantities
+                      are linearly interpolated from the two most recent
+                      anchor values, so the per-triangle mesh-clip loop only
+                      runs 1-in-N steps instead of every step. Accuracy
+                      degrades gracefully with interp_steps: at 20 steps the
+                      interpolation error is typically well below the mesh
+                      tessellation error. Recommended when simulation speed
+                      matters more than sub-millimetre CoB accuracy.
 
 The sphere/cylinder/capsule n_lat/n_lon/n_seg knobs only affect the
-mesh-clip fallback (irrelevant for spheres under 'analytic' unless you
-also force 'mesh'). Defaults were benchmarked at ~1.6% sphere-volume
-error vs. exact, at roughly 3x fewer faces than tessellation this
-codebase used to default to -- see primitive_meshes.py's
+mesh-clip fallback (irrelevant for spheres under 'analytic'/'analytic_fast'
+unless you also force 'mesh'). Defaults were benchmarked at ~1.6%
+sphere-volume error vs. exact, at roughly 3x fewer faces than tessellation
+this codebase used to default to -- see primitive_meshes.py's
 MeshResolution docstring if you want to trade accuracy for speed
 differently.
+
+interp_steps knob (analytic_fast only):
+  - Lower values (e.g. 5)  : more accurate, less speedup
+  - Default (20)           : ~17x fewer mesh-clip calls, error < 1 mm
+                             for typical swimming motions at 1 kHz
+  - Higher values (e.g. 50): maximum speedup, visible error on fast
+                             jerky motions -- test before using
 """
 
 from __future__ import annotations
@@ -81,6 +101,7 @@ class CobOptions:
 
     __slots__ = (
         'method',
+        'interp_steps',
         'sphere_n_lat', 'sphere_n_lon',
         'cylinder_n_seg',
         'capsule_n_lat', 'capsule_n_lon',
@@ -89,16 +110,23 @@ class CobOptions:
     def __init__(
         self,
         method='analytic',
+        interp_steps=20,
         sphere_n_lat=16, sphere_n_lon=32,
         cylinder_n_seg=20,
         capsule_n_lat=6, capsule_n_lon=16,
     ):
-        if method not in ('ramp', 'mesh', 'analytic'):
+        if method not in ('ramp', 'mesh', 'analytic', 'analytic_fast'):
             raise ValueError(
                 f"cob method={method!r} not recognised -- "
-                f"expected one of 'ramp', 'mesh', 'analytic'"
+                f"expected one of 'ramp', 'mesh', 'analytic', 'analytic_fast'"
+            )
+        if interp_steps < 1:
+            raise ValueError(
+                f"cob interp_steps={interp_steps!r} must be >= 1 "
+                f"(1 means recompute every step, effectively same as 'analytic')"
             )
         self.method = method
+        self.interp_steps = int(interp_steps)
         self.sphere_n_lat = sphere_n_lat
         self.sphere_n_lon = sphere_n_lon
         self.cylinder_n_seg = cylinder_n_seg
@@ -118,6 +146,8 @@ class CobOptions:
         return cls(
             method=_get(cob_block, 'method',
                         _get(water_options, 'cob_method', 'analytic')),
+            interp_steps=_get(cob_block, 'interp_steps',
+                              _get(water_options, 'cob_interp_steps', 20)),
             sphere_n_lat=_get(sphere_block, 'n_lat',
                                _get(water_options, 'cob_sphere_n_lat', 16)),
             sphere_n_lon=_get(sphere_block, 'n_lon',

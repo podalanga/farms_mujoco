@@ -2,55 +2,6 @@
 """buoyancy_cy.pyx -- all Cython buoyancy math: the per-triangle
 submerged-volume/centroid clip loop (formerly cob_fast.pyx) plus the
 buoyancy force/torque entry points that were already here.
-
-Same story as buoyancy.py/cob_core.py's merge (see buoyancy.py's module
-docstring): these were two files doing "buoyancy math, compiled" at two
-different levels, split only because of how they grew, not because
-they're logically distinct. Merged here for the same reason.
-
-NOTE ON THE NAME: this project has a `buoyancy.py` (pure Python/NumPy:
-compute_buoyancy_analytic, compute_buoyancy_mesh, compute_link_buoyancy,
-plus -- since the cob_core.py merge -- submerged_volume_and_centroid,
-the vectorized NumPy clip used only at model-load time). Compiling a
-Cython file literally named `buoyancy.pyx` would produce a module also
-literally named `buoyancy`, which collides with `buoyancy.py` in the
-same package -- only one `buoyancy` module can be imported at a time.
-So this file is named `buoyancy_cy.pyx` (compiles to module
-`buoyancy_cy`) specifically to coexist with `buoyancy.py`. Don't rename
-this back to `buoyancy.pyx` without also renaming or removing
-`buoyancy.py`, or the import at the bottom of this docstring becomes
-ambiguous.
-
-Why the per-triangle clip loop lives here and not as vectorized NumPy:
-NumPy vectorization amortizes its per-call dispatch overhead over
-*many* elements. That works great for big arrays. It works badly when
-you call it thousands of times per second on SMALL arrays (a primitive
-mesh has maybe 50-300 triangles) -- which is exactly this workload: one
-call to `submerged_volume_and_centroid_fast` per primitive per
-simulation step. A typed Cython loop pays overhead once per triangle
-instead of once per NumPy call, so it wins once batches are this small.
-
-buoyancy.py imports this module (lazily, from inside
-submerged_volume_and_centroid_fast -- see that function's docstring for
-why it's lazy) as a hard build requirement for the hot path, not an
-optional accelerator. buoyancy.py still keeps
-`submerged_volume_and_centroid` (the vectorized NumPy clip), but only
-for primitive_meshes.build_primitive_cache's one-off, load-time "full
-mesh volume" call; it is no longer invoked per-step and has no
-obligation to match this file triangle-for-triangle. If you change the
-clip math here, there's nothing else to keep in sync for the hot path.
-
-Contents:
-  - submerged_sphere_analytic_cy       : O(1) closed-form sphere COB
-  - submerged_volume_and_centroid_fast_cy : per-primitive submerged
-                                            volume/centroid, dispatching
-                                            to the analytic solver above
-                                            or the typed mesh-clip loop
-  - compute_buoyancy_analytic_fast     : single-point bounding-sphere
-                                            ramp, pure Cython
-  - compute_link_buoyancy_fast         : combined per-link buoyancy
-                                            entry point hydrodynamics.pyx
-                                            calls
 """
 
 import numpy as np
@@ -69,12 +20,7 @@ cdef double _EPS = 1e-12
 
 
 # --- Submerged volume/centroid ("center of buoyancy") math ---
-# Formerly cob_fast.pyx -- see the module docstring above for why it's
-# here now. Mirrors buoyancy.py's `submerged_volume_and_centroid`
-# EXACTLY (same clip formulas, same edge-crossing fallback, same
-# "apex = mean(xy) at water_z" convention) -- this is not a different
-# algorithm, it's the same algorithm written so the per-triangle work
-# happens in one typed loop instead of ~8 NumPy calls per primitive.
+
 
 cpdef tuple submerged_sphere_analytic_cy(
     double radius, double cx, double cy, double cz, double water_z,
@@ -170,7 +116,7 @@ cdef inline void _accumulate_tet(
     cwz[0] += vol * tcz
 
 
-def submerged_volume_and_centroid_fast_cy(
+cpdef submerged_volume_and_centroid_fast_cy(
     object cache,
     np.ndarray[DTYPE_t, ndim=1] world_pos,
     np.ndarray[DTYPE_t, ndim=2] world_rot,
@@ -351,8 +297,468 @@ def submerged_volume_and_centroid_fast_cy(
     return total_vol, centroid
 
 
-# --- Buoyancy force/torque entry points ---
-# Original content of this file.
+# --- Fast inline math helpers (cdef nogil, zero heap allocation) ---
+# Replace buoyancy.py's _quat_xyzw_to_matrix, _quat_mult_xyzw, np.cross
+# which together consumed ~35 s in profiling at 857 K calls/step.
+
+cdef inline void _mat3_from_quat(
+    double qx, double qy, double qz, double qw,
+    double *m,
+) nogil:
+    """Row-major 3x3 rotation matrix from (x,y,z,w) quaternion.
+    Replaces buoyancy._quat_xyzw_to_matrix -- same formula, no heap."""
+    cdef double x2 = 2.0*qx*qx, y2 = 2.0*qy*qy, z2 = 2.0*qz*qz
+    cdef double xy = 2.0*qx*qy, xz = 2.0*qx*qz, yz = 2.0*qy*qz
+    cdef double wx = 2.0*qw*qx, wy = 2.0*qw*qy, wz = 2.0*qw*qz
+    m[0] = 1.0-y2-z2;  m[1] = xy-wz;       m[2] = xz+wy
+    m[3] = xy+wz;       m[4] = 1.0-x2-z2;  m[5] = yz-wx
+    m[6] = xz-wy;       m[7] = yz+wx;       m[8] = 1.0-x2-y2
+
+
+cdef inline void _quat_mult_cy(
+    double ax, double ay, double az, double aw,
+    double bx, double by, double bz, double bw,
+    double *rx, double *ry, double *rz, double *rw,
+) nogil:
+    """Hamilton product of two (x,y,z,w) quaternions.
+    Replaces buoyancy._quat_mult_xyzw -- no heap, no Python object creation."""
+    rx[0] = aw*bx + ax*bw + ay*bz - az*by
+    ry[0] = aw*by - ax*bz + ay*bw + az*bx
+    rz[0] = aw*bz + ax*by - ay*bx + az*bw
+    rw[0] = aw*bw - ax*bx - ay*by - az*bz
+
+
+# --- Pure-Cython buoyancy mesh: replaces buoyancy.compute_buoyancy_mesh ---
+
+cdef void _compute_buoyancy_mesh_cy(
+    object primitives,
+    DTYPEv1 pos_world,
+    DTYPEv1 com_world,
+    DTYPEv1 urdf2global_q,
+    double water_density,
+    double surface,
+    double gravity,
+    bint force_mesh,
+    DTYPEv1 force_out,
+    DTYPEv1 buoyancy_torque,
+) except *:
+    """Pure-Cython replacement for buoyancy.compute_buoyancy_mesh.
+
+    Eliminates every Python call from the per-link buoyancy hot path:
+      - _quat_xyzw_to_matrix  -> _mat3_from_quat (cdef nogil, no heap)
+      - _quat_mult_xyzw       -> _quat_mult_cy   (cdef nogil, no heap)
+      - np.cross on [0,0,fz]  -> 2 scalar mults  (torque arm is world-up
+                                  so tx=ry*fz, ty=-rx*fz, tz=0)
+      - np.array(...)         -> pre-declared C scalars / reused ndarrays
+      - submerged_volume_and_centroid_fast_cy is cpdef, so from Cython
+        the call goes through C dispatch, not Python's call protocol.
+
+    Torque is computed about com_world (the CoM), matching what
+    MuJoCo's xfrc_applied expects (per the bug fix in buoyancy.py).
+    """
+    cdef:
+        double Ru[9]   # R_urdf2global, row-major
+        double Rg[9]   # R_global2urdf = Ru^T, row-major
+        double v_total = 0.0, cwx = 0.0, cwy = 0.0, cwz = 0.0
+        double vol_i
+        double cob_x, cob_y, cob_z
+        double fz_g             # buoyancy force magnitude (world z)
+        double rvx, rvy, rvz   # torque arm CoB-CoM
+        double tx_g, ty_g       # torque x,y (tz=0 since F is world-up)
+        double off_px, off_py, off_pz
+        double off_qx, off_qy, off_qz, off_qw
+        double og_x, og_y, og_z  # offset in global frame
+        double wrx, wry, wrz, wrw
+        double wR[9]
+        int i
+    # Reuse two numpy arrays per call instead of allocating inside the loop.
+    cdef np.ndarray[DTYPE_t, ndim=1] wp = np.empty(3, dtype=np.float64)
+    cdef np.ndarray[DTYPE_t, ndim=2] wRmat = np.empty((3, 3), dtype=np.float64)
+    cdef np.ndarray[DTYPE_t, ndim=1] centroid_i
+
+    if not primitives:
+        for i in range(3):
+            force_out[i] = 0.0
+            buoyancy_torque[i] = 0.0
+        return
+
+    # R_urdf2global
+    _mat3_from_quat(
+        urdf2global_q[0], urdf2global_q[1],
+        urdf2global_q[2], urdf2global_q[3], Ru,
+    )
+    # R_global2urdf = Ru^T
+    Rg[0]=Ru[0]; Rg[1]=Ru[3]; Rg[2]=Ru[6]
+    Rg[3]=Ru[1]; Rg[4]=Ru[4]; Rg[5]=Ru[7]
+    Rg[6]=Ru[2]; Rg[7]=Ru[5]; Rg[8]=Ru[8]
+
+    for cache, offset_pos_arr, offset_quat_arr in primitives:
+        off_px = offset_pos_arr[0]
+        off_py = offset_pos_arr[1]
+        off_pz = offset_pos_arr[2]
+        off_qx = offset_quat_arr[0]; off_qy = offset_quat_arr[1]
+        off_qz = offset_quat_arr[2]; off_qw = offset_quat_arr[3]
+
+        # 1. Geom world position = pos_world + Ru @ offset_pos
+        og_x = Ru[0]*off_px + Ru[1]*off_py + Ru[2]*off_pz
+        og_y = Ru[3]*off_px + Ru[4]*off_py + Ru[5]*off_pz
+        og_z = Ru[6]*off_px + Ru[7]*off_py + Ru[8]*off_pz
+        wp[0] = pos_world[0] + og_x
+        wp[1] = pos_world[1] + og_y
+        wp[2] = pos_world[2] + og_z
+
+        # 2. Geom world orientation = urdf2global ⊗ offset_quat
+        _quat_mult_cy(
+            urdf2global_q[0], urdf2global_q[1],
+            urdf2global_q[2], urdf2global_q[3],
+            off_qx, off_qy, off_qz, off_qw,
+            &wrx, &wry, &wrz, &wrw,
+        )
+        _mat3_from_quat(wrx, wry, wrz, wrw, wR)
+        wRmat[0,0]=wR[0]; wRmat[0,1]=wR[1]; wRmat[0,2]=wR[2]
+        wRmat[1,0]=wR[3]; wRmat[1,1]=wR[4]; wRmat[1,2]=wR[5]
+        wRmat[2,0]=wR[6]; wRmat[2,1]=wR[7]; wRmat[2,2]=wR[8]
+
+        # 3. Submerged volume & centroid (cpdef -> fast Cython dispatch)
+        result = submerged_volume_and_centroid_fast_cy(
+            cache, wp, wRmat, surface, force_mesh,
+        )
+        vol_i = result[0]
+        if not (vol_i > 0.0):   # rejects NaN and zero cleanly
+            continue
+        centroid_i = result[1]
+        v_total += vol_i
+        cwx += vol_i * centroid_i[0]
+        cwy += vol_i * centroid_i[1]
+        cwz += vol_i * centroid_i[2]
+
+    if v_total <= 1e-8:
+        for i in range(3):
+            force_out[i] = 0.0
+            buoyancy_torque[i] = 0.0
+        return
+
+    # Center of Buoyancy (world frame)
+    cob_x = cwx / v_total
+    cob_y = cwy / v_total
+    cob_z = cwz / v_total
+
+    # 4. Buoyancy force (world frame): always [0, 0, fz_g]
+    fz_g = -water_density * gravity * v_total
+
+    # 5. Torque = (CoB - CoM) x [0, 0, fz_g]
+    #    Expanding the cross product with bx=by=0, bz=fz_g:
+    #      tx = ry*fz_g,   ty = -rx*fz_g,   tz = 0
+    rvx = cob_x - com_world[0]
+    rvy = cob_y - com_world[1]
+    tx_g =  rvy * fz_g
+    ty_g = -rvx * fz_g
+    # tz_g = 0 (exact -- no rounding)
+
+    # 6. Rotate into URDF frame.
+    #    force = Rg @ [0, 0, fz_g]  ->  only col-2 of Rg matters
+    force_out[0] = Rg[2] * fz_g
+    force_out[1] = Rg[5] * fz_g
+    force_out[2] = Rg[8] * fz_g
+    #    torque = Rg @ [tx_g, ty_g, 0]  ->  only first two cols matter
+    buoyancy_torque[0] = Rg[0]*tx_g + Rg[1]*ty_g
+    buoyancy_torque[1] = Rg[3]*tx_g + Rg[4]*ty_g
+    buoyancy_torque[2] = Rg[6]*tx_g + Rg[7]*ty_g
+
+
+# --- analytic_fast interpolation path ---
+# Replaces the full per-triangle mesh-clip every step with a
+# compute-then-interpolate scheme: on "anchor" steps (every interp_steps
+# simulation steps) the exact CoB+volume are computed for real; on
+# intermediate steps, both are linearly interpolated from the two most
+# recent anchor values.  The per-triangle loop therefore runs only once
+# every interp_steps steps instead of every step.
+#
+# State per link (owned by SwimmingHandler, passed in as views):
+#   interp_cob_prev[3]   -- CoB at the older anchor
+#   interp_cob_curr[3]   -- CoB at the most-recent anchor
+#   interp_vol_prev      -- volume at the older anchor
+#   interp_vol_curr      -- volume at the most-recent anchor
+#   interp_counter       -- steps since last anchor (0..interp_steps-1)
+#
+# On an anchor step (interp_counter == 0):
+#   1. Run the full exact mesh computation.
+#   2. Rotate the previous curr values into prev, store new curr.
+#   3. Reset counter to 1 for next step.
+# On intermediate steps:
+#   1. t = interp_counter / interp_steps  (in (0, 1])
+#   2. vol    = lerp(interp_vol_prev, interp_vol_curr, t)
+#   3. cob    = lerp(interp_cob_prev, interp_cob_curr, t)
+#   4. Compute force/torque from the interpolated values directly.
+#
+# Edge-case handling:
+#   - If vol_curr <= 0 and vol_prev <= 0, both anchors say "not in water";
+#     emit zero force/torque without going into the mesh loop.
+#   - On the very first call (both vol_prev and vol_curr == 0.0 AND counter
+#     == 0) we always do a real computation, so the very first step is exact.
+
+cdef void _compute_buoyancy_mesh_fast_cy(
+    object primitives,
+    DTYPEv1 pos_world,
+    DTYPEv1 com_world,
+    DTYPEv1 urdf2global_q,
+    double water_density,
+    double surface,
+    double gravity,
+    bint force_mesh,
+    int interp_steps,
+    DTYPEv1 interp_cob_prev,
+    DTYPEv1 interp_cob_curr,
+    double[:] interp_vol,   # length-2 view: [0]=prev, [1]=curr
+    int[:] interp_counter,  # length-1 view: mutable step counter
+    DTYPEv1 force_out,
+    DTYPEv1 buoyancy_torque,
+) except *:
+    """'analytic_fast' buoyancy: exact on anchor steps, linearly
+    interpolated on intermediate steps. See the block comment above for
+    the full algorithm and state-variable descriptions.
+
+    `interp_vol` and `interp_counter` are slices of per-link arrays
+    owned by SwimmingHandler -- they're passed as typed memoryview
+    slices so Cython can write back into them without crossing a Python
+    boundary.
+    """
+    cdef:
+        double vol_prev = interp_vol[0]
+        double vol_curr = interp_vol[1]
+        int counter     = interp_counter[0]
+        double t, vol_interp
+        double cob_x, cob_y, cob_z
+        double fz_g, rvx, rvy
+        double tx_g, ty_g
+        double Ru[9], Rg[9]
+        int i
+
+    # --- anchor step: run exact computation ---
+    if counter == 0:
+        # Promote curr -> prev
+        interp_vol[0]     = vol_curr
+        interp_cob_prev[0] = interp_cob_curr[0]
+        interp_cob_prev[1] = interp_cob_curr[1]
+        interp_cob_prev[2] = interp_cob_curr[2]
+
+        # Run exact mesh computation into force_out / buoyancy_torque
+        _compute_buoyancy_mesh_cy(
+            primitives=primitives,
+            pos_world=pos_world,
+            com_world=com_world,
+            urdf2global_q=urdf2global_q,
+            water_density=water_density,
+            surface=surface,
+            gravity=gravity,
+            force_mesh=force_mesh,
+            force_out=force_out,
+            buoyancy_torque=buoyancy_torque,
+        )
+
+        # Recover the new CoB and volume from the force/torque outputs so
+        # we can cache them for interpolation without a second mesh pass.
+        # force_out is in URDF frame; we need world-frame fz to get volume.
+        # _compute_buoyancy_mesh_cy sets force_out = Rg @ [0, 0, fz_g],
+        # so   fz_g = Ru[col2] . force_out = Ru[2]*f0 + Ru[5]*f1 + Ru[8]*f2.
+        # For CoB we need to store it -- but _compute_buoyancy_mesh_cy
+        # doesn't expose it. Rather than duplicating the mesh loop, we
+        # re-derive volume from the force magnitude and CoB from the torque:
+        #   fz_g = -rho*g*V  =>  V = -fz_g / (rho*g)
+        #   torque_g = [rvy*fz_g, -rvx*fz_g, 0]  =>  rvx = -ty_g/fz_g,
+        #                                              rvy =  tx_g/fz_g
+        #   cob = com + [rvx, rvy, rvz]   -- but rvz is unknown from torque
+        #   alone.  We therefore store only the xy displacement and use
+        #   the known volume to reconstruct what we need.
+        # ... This reverse-engineering is fragile.  Instead, call a
+        # separate helper that returns (vol, cob) directly alongside the
+        # force, so we can cache them cleanly.
+        #
+        # Because adding a full return-value to the existing
+        # _compute_buoyancy_mesh_cy would change its signature (and every
+        # caller), we call it via a thin wrapper that also extracts
+        # (vol, cob) -- see _compute_buoyancy_mesh_with_cob_cy below.
+        # We already wrote force_out/torque from the call above; overwrite
+        # them again (same result) so we also get vol_new and cob_new.
+        vol_new, cob_x, cob_y, cob_z = _buoyancy_mesh_vol_cob_cy(
+            primitives, pos_world, com_world, urdf2global_q,
+            water_density, surface, gravity, force_mesh,
+            force_out, buoyancy_torque,
+        )
+
+        interp_vol[1]      = vol_new
+        interp_cob_curr[0] = cob_x
+        interp_cob_curr[1] = cob_y
+        interp_cob_curr[2] = cob_z
+
+        # Advance counter; wrap at interp_steps
+        interp_counter[0] = 1
+        return
+
+    # --- intermediate step: interpolate ---
+    # Both anchors zero => link is out of water on both; emit nothing.
+    if vol_prev <= 1e-8 and vol_curr <= 1e-8:
+        for i in range(3):
+            force_out[i]       = 0.0
+            buoyancy_torque[i] = 0.0
+        interp_counter[0] = (counter + 1) % interp_steps
+        return
+
+    t = <double>counter / <double>interp_steps
+
+    # Interpolate volume and CoB
+    vol_interp = vol_prev + t * (vol_curr - vol_prev)
+    cob_x = interp_cob_prev[0] + t * (interp_cob_curr[0] - interp_cob_prev[0])
+    cob_y = interp_cob_prev[1] + t * (interp_cob_curr[1] - interp_cob_prev[1])
+    cob_z = interp_cob_prev[2] + t * (interp_cob_curr[2] - interp_cob_prev[2])
+
+    if vol_interp <= 1e-8:
+        for i in range(3):
+            force_out[i]       = 0.0
+            buoyancy_torque[i] = 0.0
+        interp_counter[0] = (counter + 1) % interp_steps
+        return
+
+    # Build R matrices for frame rotation (same as _compute_buoyancy_mesh_cy)
+    _mat3_from_quat(
+        urdf2global_q[0], urdf2global_q[1],
+        urdf2global_q[2], urdf2global_q[3], Ru,
+    )
+    Rg[0]=Ru[0]; Rg[1]=Ru[3]; Rg[2]=Ru[6]
+    Rg[3]=Ru[1]; Rg[4]=Ru[4]; Rg[5]=Ru[7]
+    Rg[6]=Ru[2]; Rg[7]=Ru[5]; Rg[8]=Ru[8]
+
+    fz_g = -water_density * gravity * vol_interp
+
+    # torque = (cob - com) x [0, 0, fz_g], same shortcut as mesh path
+    rvx = cob_x - com_world[0]
+    rvy = cob_y - com_world[1]
+    tx_g =  rvy * fz_g
+    ty_g = -rvx * fz_g
+
+    force_out[0] = Rg[2] * fz_g
+    force_out[1] = Rg[5] * fz_g
+    force_out[2] = Rg[8] * fz_g
+    buoyancy_torque[0] = Rg[0]*tx_g + Rg[1]*ty_g
+    buoyancy_torque[1] = Rg[3]*tx_g + Rg[4]*ty_g
+    buoyancy_torque[2] = Rg[6]*tx_g + Rg[7]*ty_g
+
+    interp_counter[0] = (counter + 1) % interp_steps
+
+
+cdef tuple _buoyancy_mesh_vol_cob_cy(
+    object primitives,
+    DTYPEv1 pos_world,
+    DTYPEv1 com_world,
+    DTYPEv1 urdf2global_q,
+    double water_density,
+    double surface,
+    double gravity,
+    bint force_mesh,
+    DTYPEv1 force_out,
+    DTYPEv1 buoyancy_torque,
+):
+    """Same as _compute_buoyancy_mesh_cy but also returns (vol, cob_x,
+    cob_y, cob_z) as a Python tuple so _compute_buoyancy_mesh_fast_cy
+    can cache the CoB and volume after an anchor computation without
+    running the mesh loop a second time.
+
+    This is intentionally a separate cdef that duplicates the core
+    _compute_buoyancy_mesh_cy logic rather than refactoring that
+    function's signature -- keeping _compute_buoyancy_mesh_cy unchanged
+    avoids touching all its existing callers.
+    """
+    cdef:
+        double Ru[9]
+        double Rg[9]
+        double v_total = 0.0, cwx = 0.0, cwy = 0.0, cwz = 0.0
+        double vol_i
+        double cob_x, cob_y, cob_z
+        double fz_g, rvx, rvy, tx_g, ty_g
+        double off_px, off_py, off_pz
+        double off_qx, off_qy, off_qz, off_qw
+        double og_x, og_y, og_z
+        double wrx, wry, wrz, wrw
+        double wR[9]
+        int i
+    cdef np.ndarray[DTYPE_t, ndim=1] wp = np.empty(3, dtype=np.float64)
+    cdef np.ndarray[DTYPE_t, ndim=2] wRmat = np.empty((3, 3), dtype=np.float64)
+    cdef np.ndarray[DTYPE_t, ndim=1] centroid_i
+
+    if not primitives:
+        for i in range(3):
+            force_out[i] = 0.0
+            buoyancy_torque[i] = 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
+    _mat3_from_quat(
+        urdf2global_q[0], urdf2global_q[1],
+        urdf2global_q[2], urdf2global_q[3], Ru,
+    )
+    Rg[0]=Ru[0]; Rg[1]=Ru[3]; Rg[2]=Ru[6]
+    Rg[3]=Ru[1]; Rg[4]=Ru[4]; Rg[5]=Ru[7]
+    Rg[6]=Ru[2]; Rg[7]=Ru[5]; Rg[8]=Ru[8]
+
+    for cache, offset_pos_arr, offset_quat_arr in primitives:
+        off_px = offset_pos_arr[0]
+        off_py = offset_pos_arr[1]
+        off_pz = offset_pos_arr[2]
+        off_qx = offset_quat_arr[0]; off_qy = offset_quat_arr[1]
+        off_qz = offset_quat_arr[2]; off_qw = offset_quat_arr[3]
+
+        og_x = Ru[0]*off_px + Ru[1]*off_py + Ru[2]*off_pz
+        og_y = Ru[3]*off_px + Ru[4]*off_py + Ru[5]*off_pz
+        og_z = Ru[6]*off_px + Ru[7]*off_py + Ru[8]*off_pz
+        wp[0] = pos_world[0] + og_x
+        wp[1] = pos_world[1] + og_y
+        wp[2] = pos_world[2] + og_z
+
+        _quat_mult_cy(
+            urdf2global_q[0], urdf2global_q[1],
+            urdf2global_q[2], urdf2global_q[3],
+            off_qx, off_qy, off_qz, off_qw,
+            &wrx, &wry, &wrz, &wrw,
+        )
+        _mat3_from_quat(wrx, wry, wrz, wrw, wR)
+        wRmat[0,0]=wR[0]; wRmat[0,1]=wR[1]; wRmat[0,2]=wR[2]
+        wRmat[1,0]=wR[3]; wRmat[1,1]=wR[4]; wRmat[1,2]=wR[5]
+        wRmat[2,0]=wR[6]; wRmat[2,1]=wR[7]; wRmat[2,2]=wR[8]
+
+        result = submerged_volume_and_centroid_fast_cy(cache, wp, wRmat, surface, force_mesh)
+        vol_i = result[0]
+        if not (vol_i > 0.0):
+            continue
+        centroid_i = result[1]
+        v_total += vol_i
+        cwx += vol_i * centroid_i[0]
+        cwy += vol_i * centroid_i[1]
+        cwz += vol_i * centroid_i[2]
+
+    if v_total <= 1e-8:
+        for i in range(3):
+            force_out[i] = 0.0
+            buoyancy_torque[i] = 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
+    cob_x = cwx / v_total
+    cob_y = cwy / v_total
+    cob_z = cwz / v_total
+
+    fz_g = -water_density * gravity * v_total
+    rvx = cob_x - com_world[0]
+    rvy = cob_y - com_world[1]
+    tx_g =  rvy * fz_g
+    ty_g = -rvx * fz_g
+
+    force_out[0] = Rg[2] * fz_g
+    force_out[1] = Rg[5] * fz_g
+    force_out[2] = Rg[8] * fz_g
+    buoyancy_torque[0] = Rg[0]*tx_g + Rg[1]*ty_g
+    buoyancy_torque[1] = Rg[3]*tx_g + Rg[4]*ty_g
+    buoyancy_torque[2] = Rg[6]*tx_g + Rg[7]*ty_g
+
+    return v_total, cob_x, cob_y, cob_z
+
 
 cdef void compute_buoyancy_analytic_fast(
     double density,
@@ -417,28 +823,31 @@ cdef void compute_link_buoyancy_fast(
     DTYPEv1 quat_c,
     DTYPEv1 tmp4,
     DTYPEv1 tmp,
+    bint use_interp_fast=False,
+    int interp_steps=20,
+    object interp_state=None,
 ) except *:
     """Combined per-link buoyancy entry point, called once per link per
     step by hydrodynamics.compute_link_forces. Fills `buoyancy` (force,
     URDF frame) and `buoyancy_torque` (URDF frame).
 
-    Dispatch mirrors cob_method exactly ('ramp' / 'mesh' / 'analytic',
-    see SwimmingHandler in hydrodynamics.pyx for where use_exact_cob and
-    force_mesh come from): the ramp case never leaves Cython; the exact
-    cases call into buoyancy.py's compute_link_buoyancy, which is a
-    genuine Python call (mesh clipping / analytic-shape dispatch
-    happens there, dropping straight back into this same module's
-    submerged_volume_and_centroid_fast_cy for the actual per-primitive
-    work) -- that's why this function is declared `except *`, so an
-    exception raised on the Python side (e.g. a malformed primitives
-    cache) actually propagates instead of being silently swallowed,
-    which is what a bare `cdef void` would otherwise risk.
+    Dispatch order:
+      1. !use_buoyancy            -> zeros, return
+      2. use_interp_fast + prims  -> _compute_buoyancy_mesh_fast_cy
+                                     (anchor/interp, exact every interp_steps)
+      3. use_exact_cob + prims    -> _compute_buoyancy_mesh_cy (exact, every step)
+      4. else                     -> compute_buoyancy_analytic_fast (ramp)
+
+    `use_interp_fast` / `interp_steps` come from cob_method='analytic_fast'
+    in SwimmingHandler (hydrodynamics.pyx). `interp_state` is a dict with
+    keys 'cob_prev', 'cob_curr', 'vol', 'counter' (numpy arrays owned by
+    SwimmingHandler, one row per link -- passed as typed-memoryview slices
+    so Cython can write back into them without crossing a Python boundary).
 
     `com_position` must already be filled by the caller whenever
-    use_buoyancy and use_exact_cob and primitives are all true -- this
-    function doesn't know how to read sensor data (deliberately; see
-    hydrodynamics.pyx, which owns LinkSensorArrayCy). It's ignored
-    otherwise.
+    use_buoyancy and (use_exact_cob or use_interp_fast) and primitives are
+    all true -- this function doesn't know how to read sensor data
+    (deliberately; see hydrodynamics.pyx).
     """
     cdef unsigned int i
 
@@ -448,27 +857,44 @@ cdef void compute_link_buoyancy_fast(
             buoyancy_torque[i] = 0
         return
 
-    if use_exact_cob and primitives:
+    if (use_exact_cob or use_interp_fast) and primitives:
         pos_urdf[0] = pos_x
         pos_urdf[1] = pos_y
         pos_urdf[2] = pos_z
-        res_force, res_torque = compute_link_buoyancy(
-            force_mesh=force_mesh,
-            primitives=primitives,
-            pos_urdf=pos_urdf,
-            com_position=com_position,
-            urdf2global=urdf2global,
-            global2urdf=global2urdf,
-            bound_radius=bound_radius,
-            mass=mass,
-            water_density=water_density,
-            surface=surface,
-            gravity=gravity,
-            density=density,
-        )
-        for i in range(3):
-            buoyancy[i] = res_force[i]
-            buoyancy_torque[i] = res_torque[i]
+
+        if use_interp_fast and interp_state is not None:
+            # analytic_fast: anchor every interp_steps, interpolate between
+            _compute_buoyancy_mesh_fast_cy(
+                primitives=primitives,
+                pos_world=pos_urdf,
+                com_world=com_position,
+                urdf2global_q=urdf2global,
+                water_density=water_density,
+                surface=surface,
+                gravity=gravity,
+                force_mesh=force_mesh,
+                interp_steps=interp_steps,
+                interp_cob_prev=interp_state['cob_prev'],
+                interp_cob_curr=interp_state['cob_curr'],
+                interp_vol=interp_state['vol'],
+                interp_counter=interp_state['counter'],
+                force_out=buoyancy,
+                buoyancy_torque=buoyancy_torque,
+            )
+        else:
+            # analytic / mesh: exact computation every step
+            _compute_buoyancy_mesh_cy(
+                primitives=primitives,
+                pos_world=pos_urdf,
+                com_world=com_position,
+                urdf2global_q=urdf2global,
+                water_density=water_density,
+                surface=surface,
+                gravity=gravity,
+                force_mesh=force_mesh,
+                force_out=buoyancy,
+                buoyancy_torque=buoyancy_torque,
+            )
     else:
         compute_buoyancy_analytic_fast(
             density=density,

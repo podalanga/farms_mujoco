@@ -1,28 +1,4 @@
-"""hydrodynamics.pyx -- orchestration layer for swimming forces.
-
-This is the third piece of what used to be a single drag.pyx:
-  - drag.pyx          -- drag force/torque only
-  - buoyancy_cy.pyx    -- buoyancy force/torque only
-  - hydrodynamics.pyx  (this file) -- everything that combines them:
-      * link_swimming_info      : per-link kinematic state (shared by
-                                   both drag and buoyancy)
-      * compute_link_forces     : combines drag + buoyancy for one
-                                   link, URDF frame, pure computation
-                                   (no side effects, easy to test)
-      * apply_swimming_forces   : calls compute_link_forces and writes
-                                   the result into data_xfrc (the only
-                                   function with that side effect)
-      * WaterProperties and subclasses
-      * SwimmingHandler          : owns per-simulation config (drag/
-                                   buoyancy/sph toggles, cob_method,
-                                   mesh resolution, primitive caches)
-                                   and drives the per-step loop.
-
-Nothing here does its own physics math -- it calls into drag.pyx's
-compute_link_drag_fast and buoyancy_cy.pyx's compute_link_buoyancy_fast
-(both cimported below, so these are direct C-level calls with no Python
-overhead, same as if the code were still all in one file).
-"""
+"""hydrodynamics.pyx -- orchestration layer for swimming forces."""
 
 include 'types.pxd'
 
@@ -370,6 +346,8 @@ cdef class SwimmingHandler:
     cdef bint buoyancy
     cdef bint use_exact_cob
     cdef bint force_mesh
+    cdef bint use_interp_fast      # True when cob_method == 'analytic_fast'
+    cdef int   interp_steps        # steps between full recomputations
     cdef object cob_method
     cdef object link_primitives
     cdef WaterProperties water
@@ -385,6 +363,11 @@ cdef class SwimmingHandler:
     cdef DTYPEv2 z3
     cdef DTYPEv2 z4
     cdef DTYPEv3 links_coefficients
+    # analytic_fast interpolation state (one row per link)
+    cdef DTYPEv2 interp_cob_prev   # (n_links, 3) world-frame CoB at older anchor
+    cdef DTYPEv2 interp_cob_curr   # (n_links, 3) world-frame CoB at most-recent anchor
+    cdef DTYPEv2 interp_vol        # (n_links, 2): [prev_vol, curr_vol]
+    cdef np.ndarray interp_counter_arr  # (n_links,) int32 step counter
 
     def __init__(self, data, animat_options, arena_options, units, physics, water=None, prefix=''):
         super(SwimmingHandler, self).__init__()
@@ -432,9 +415,11 @@ cdef class SwimmingHandler:
         print("method:", cob_options.method)
         print("cylinder n_seg:", cob_options.cylinder_n_seg)
 
-        self.cob_method = cob_options.method
-        self.use_exact_cob = self.cob_method != 'ramp'
-        self.force_mesh = self.cob_method == 'mesh'
+        self.cob_method      = cob_options.method
+        self.use_exact_cob   = self.cob_method not in ('ramp',)
+        self.force_mesh      = self.cob_method == 'mesh'
+        self.use_interp_fast = self.cob_method == 'analytic_fast'
+        self.interp_steps    = cob_options.interp_steps
         mesh_resolution = cob_options.to_mesh_resolution()
 
         links = [
@@ -494,6 +479,14 @@ cdef class SwimmingHandler:
             ]
         else:
             self.link_primitives = [None]*self.n_links
+
+        # Per-link analytic_fast interpolation state.
+        # Initialised to zero; the first call is always an anchor step
+        # (counter == 0) so the very first simulation step is exact.
+        self.interp_cob_prev    = np.zeros((self.n_links, 3), dtype=float)
+        self.interp_cob_curr    = np.zeros((self.n_links, 3), dtype=float)
+        self.interp_vol         = np.zeros((self.n_links, 2), dtype=float)
+        self.interp_counter_arr = np.zeros(self.n_links, dtype=np.intc)
 
         if self.sph:
             self.water._surface = 1e8
