@@ -344,8 +344,13 @@ def compute_buoyancy_mesh(primitives, pos_urdf, com_position, urdf2global, globa
     force_global = np.array([0.0, 0.0, -water_density * gravity * v_total])
 
     # 5. Righting torque about CoM (World Frame) -> tau = (CB - CoM) x F
-    # r_vec = cob_world - com_position
-    r_vec = cob_world - pos_urdf
+    # com_position is the world-frame CoM position filled by
+    # hydrodynamics.pyx from data_links.com_position_cy -- this MUST be
+    # the CoM, not the URDF frame origin (pos_urdf), because MuJoCo's
+    # xfrc_applied torque is applied about the CoM.  Using pos_urdf here
+    # when CoM != URDF origin gives the wrong restoring torque direction
+    # and magnitude, causing the body to topple instead of righting.
+    r_vec = cob_world - com_position
     torque_global = np.cross(r_vec, force_global)
 
     # 6. Rotate both into URDF frame
