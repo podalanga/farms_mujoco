@@ -121,9 +121,10 @@ cdef bint compute_link_forces(
     (cimported via .pxd), not Python calls.
     """
     cdef unsigned int i
-    cdef double pos_x = data_links.array[iteration, links_index, 0]
-    cdef double pos_y = data_links.array[iteration, links_index, 1]
-    cdef double pos_z = data_links.array[iteration, links_index, 2]
+    urdf_pos = data_links.urdf_position_cy(iteration, links_index)
+    cdef double pos_x = urdf_pos[0]
+    cdef double pos_y = urdf_pos[1]
+    cdef double pos_z = urdf_pos[2]
     cdef double surface = water.surface(time, pos_x, pos_y)
 
     if pos_z - bound_radius > surface:
@@ -416,7 +417,21 @@ cdef class SwimmingHandler:
         # Resolved once here into the two bints compute_link_forces
         # actually branches on every link every step, so that hot path
         # never does a string comparison.
+
+
+        print("WATER OPTIONS:")
+        print(water_options)
+        print("cob_method:", getattr(water_options, "cob_method", "MISSING"))
+        print("cob_cylinder_n_seg:", getattr(water_options, "cob_cylinder_n_seg", "MISSING"))
+
+
         cob_options = CobOptions.from_water_options(water_options)
+
+        print("COB OPTIONS:")
+        print(cob_options)
+        print("method:", cob_options.method)
+        print("cylinder n_seg:", cob_options.cylinder_n_seg)
+
         self.cob_method = cob_options.method
         self.use_exact_cob = self.cob_method != 'ramp'
         self.force_mesh = self.cob_method == 'mesh'

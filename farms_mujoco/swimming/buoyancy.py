@@ -344,7 +344,8 @@ def compute_buoyancy_mesh(primitives, pos_urdf, com_position, urdf2global, globa
     force_global = np.array([0.0, 0.0, -water_density * gravity * v_total])
 
     # 5. Righting torque about CoM (World Frame) -> tau = (CB - CoM) x F
-    r_vec = cob_world - com_position
+    # r_vec = cob_world - com_position
+    r_vec = cob_world - pos_urdf
     torque_global = np.cross(r_vec, force_global)
 
     # 6. Rotate both into URDF frame
