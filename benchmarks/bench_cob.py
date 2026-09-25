@@ -10,7 +10,8 @@ import sys
 
 import numpy as np
 
-from farms_mujoco.swimming import cob
+from farms_mujoco.swimming import cob, cob_lut
+from farms_mujoco.swimming.cob_lut_build import build_link_lut
 from farms_mujoco.swimming.cob_build import (
     SPHERE, ELLIPSOID, CYLINDER, CAPSULE, POLYHEDRON,
     GeomInfo, assemble_cob_geometry, box_triangles,
@@ -42,8 +43,17 @@ def main():
         straddle = np.linspace(-0.04, 0.04, 17)
         ns_cross, _ = cob.benchmark_geom(model, 0, rot, np.zeros(3), straddle, 2000)
         ns_wet, _ = cob.benchmark_geom(model, 0, rot, np.zeros(3), [10.0], 200000)
-        results[name] = {'crossing_ns': round(ns_cross, 1), 'wet_ns': round(ns_wet, 1)}
-        print(f'{name:28s} crossing {ns_cross:9.1f} ns   fully wet {ns_wet:6.1f} ns')
+        geom = GeomInfo(0, 0, kind, np.array(size, float), np.zeros(3), np.eye(3), tris)
+        lut = cob_lut.CobLut([0], [build_link_lut([geom], disk_cache=False)], (32, 64))
+        ns_lut, _ = cob_lut.benchmark_link(lut, 0, rot, np.zeros(3), straddle, 2000)
+        results[name] = {
+            'crossing_ns': round(ns_cross, 1), 'wet_ns': round(ns_wet, 1),
+            'lut_crossing_ns': round(ns_lut, 1),
+        }
+        print(
+            f'{name:28s} crossing {ns_cross:9.1f} ns   fully wet {ns_wet:6.1f} ns'
+            f'   LUT {ns_lut:6.1f} ns'
+        )
     if len(sys.argv) > 1:
         with open(sys.argv[1], 'w', encoding='utf-8') as outfile:
             json.dump(results, outfile, indent=2)

@@ -81,6 +81,10 @@ def run(experiment_dir, iterations, water_overrides, n_animats=1):
             animat = copy.deepcopy(base)
             animat.spawn.pose[0] += 0.5*i
             options.animats.append(animat)
+        loaders = options.loaders
+        for name in ('animats_options', 'animats_data'):
+            items = loaders[name] if isinstance(loaders, dict) else getattr(loaders, name)
+            items[:] = [items[0]]*n_animats
 
     # Time the swimming extension
     timings = []
