@@ -8,6 +8,7 @@ Everything is converted to SI units and flattened into arrays:
   nodes carry precomputed divergence-theorem moments (see cob.pyx).
 """
 
+import hashlib
 import warnings
 from dataclasses import dataclass, field
 
@@ -343,37 +344,116 @@ def geom_bounds(geom):
     return points.min(axis=0), points.max(axis=0)
 
 
-def estimate_overlap(geoms, n_samples=20000, seed=0):
-    """Monte Carlo estimate of union volume / sum of volumes for a link"""
-    if len(geoms) < 2:
-        return 1.0
+def mesh_inside_grid(tris, xs, ys, zs):
+    """Inside mask [nx, ny, nz] of grid points for a closed mesh, by the
+    parity of vertical ray crossings (cost ~ grid columns under each
+    triangle)"""
+    nx, ny, nz = len(xs), len(ys), len(zs)
+    hits = np.zeros([nx, ny, nz + 1], dtype=np.int32)
+    for tri in tris:
+        (x0, y0, z0), (x1, y1, z1), (x2, y2, z2) = tri
+        i0, i1 = np.searchsorted(xs, [min(x0, x1, x2), max(x0, x1, x2)])
+        j0, j1 = np.searchsorted(ys, [min(y0, y1, y2), max(y0, y1, y2)])
+        if i1 <= i0 or j1 <= j0:
+            continue
+        det = (y1 - y2)*(x0 - x2) + (x2 - x1)*(y0 - y2)
+        if abs(det) < 1e-300:
+            continue
+        px, py = np.meshgrid(xs[i0:i1], ys[j0:j1], indexing='ij')
+        l0 = ((y1 - y2)*(px - x2) + (x2 - x1)*(py - y2))/det
+        l1 = ((y2 - y0)*(px - x2) + (x0 - x2)*(py - y2))/det
+        l2 = 1 - l0 - l1
+        inside = (l0 >= 0) & (l1 >= 0) & (l2 >= 0)
+        if not np.any(inside):
+            continue
+        z_hit = l0*z0 + l1*z1 + l2*z2
+        ii, jj = np.nonzero(inside)
+        k = np.searchsorted(zs, z_hit[ii, jj])
+        # Every point below the hit sees one more crossing above it
+        np.add.at(hits, (ii + i0, jj + j0, 0), 1)
+        np.add.at(hits, (ii + i0, jj + j0, k), -1)
+    return (np.cumsum(hits, axis=2)[:, :, :nz] % 2) == 1
+
+
+def link_grid(geoms, cells=64, min_cells=12, max_points=4_000_000):
+    """Regular grid axes covering the geoms of a link (link frame)"""
     bounds = np.array([geom_bounds(geom) for geom in geoms])
     lo, hi = bounds[:, 0].min(axis=0), bounds[:, 1].max(axis=0)
-    rng = np.random.default_rng(seed)
-    points = lo + (hi - lo)*rng.random([n_samples, 3])
-    count = np.zeros(n_samples, dtype=int)
+    extent = np.maximum(hi - lo, 1e-12)
+    step = min(np.max(extent)/cells, np.min(extent)/min_cells)
+    step = max(step, (np.prod(extent)/max_points)**(1/3))
+    counts = np.maximum(np.ceil(extent/step).astype(int), 1)
+    # Slight offset avoids rays grazing mesh vertices and edges
+    return [
+        lo[i] + step*(np.arange(counts[i]) + 0.5 + 1e-4*(i + 1))
+        for i in range(3)
+    ], step
+
+
+def geom_inside_grid(geom, axes):
+    """Inside mask (flattened) of the grid points for a geom"""
+    if geom.kind == POLYHEDRON:
+        return mesh_inside_grid(
+            geom.tris @ geom.rot.T + geom.pos, *axes,
+        ).reshape(-1)
+    points = np.stack(np.meshgrid(*axes, indexing='ij'), axis=-1).reshape(-1, 3)
+    return points_inside(geom.kind, geom.size, (points - geom.pos) @ geom.rot)
+
+
+def estimate_overlap(geoms, cells=48):
+    """Union volume / sum of volumes of a link's geoms (grid estimate)"""
+    if len(geoms) < 2:
+        return 1.0
+    axes, _ = link_grid(geoms, cells=cells)
+    union = None
+    total = 0
     for geom in geoms:
-        local = (points - geom.pos) @ geom.rot
-        count += points_inside(geom.kind, geom.size, local, geom.tris)
-    total = count.sum()
-    return float(np.count_nonzero(count)/total) if total else 1.0
+        inside = geom_inside_grid(geom, axes)
+        total += np.count_nonzero(inside)
+        union = inside if union is None else union | inside
+    return float(np.count_nonzero(union)/total) if total else 1.0
 
 
-def build_cob_geometry(model, body_ids, geom_group=2, meters=1.0, overlap='ignore'):
-    """Build the flattened CoB geometry for the given MuJoCo bodies"""
-    return assemble_cob_geometry(
-        geoms=link_geoms(model, body_ids, geom_group=geom_group, meters=meters),
-        n_links=len(body_ids),
-        overlap=overlap,
-    )
+def geoms_key(geoms, *extra):
+    """Hash identifying a list of geoms (and extra parameters)"""
+    digest = hashlib.sha1()
+    digest.update(np.asarray(extra, dtype=float).tobytes())
+    for geom in geoms:
+        digest.update(np.asarray([geom.geom_id, geom.link, geom.kind], dtype=float).tobytes())
+        digest.update(np.asarray(geom.size, dtype=float).tobytes())
+        digest.update(np.asarray(geom.pos, dtype=float).tobytes())
+        digest.update(np.asarray(geom.rot, dtype=float).tobytes())
+        if geom.tris is not None:
+            digest.update(np.ascontiguousarray(geom.tris, dtype=float).tobytes())
+    return digest.hexdigest()
 
 
-def assemble_cob_geometry(geoms, n_links, overlap='ignore'):
+_CACHE = {}
+
+
+def build_cob_geometry(model, body_ids, geom_group=2, meters=1.0,
+                       overlap='ignore', report_overlap=False):
+    """Build the flattened CoB geometry for the given MuJoCo bodies (cached
+    by geometry, so episode resets do not rebuild it)"""
+    geoms = link_geoms(model, body_ids, geom_group=geom_group, meters=meters)
+    key = geoms_key(geoms, len(body_ids), overlap == 'scale', report_overlap)
+    if key not in _CACHE:
+        _CACHE[key] = assemble_cob_geometry(
+            geoms=geoms,
+            n_links=len(body_ids),
+            overlap=overlap,
+            report_overlap=report_overlap,
+        )
+    return _CACHE[key]
+
+
+def assemble_cob_geometry(geoms, n_links, overlap='ignore', report_overlap=False):
     """Flatten a list of GeomInfo into a CobGeometry.
 
     overlap='scale' rescales each link's geoms by (union volume / sum of
     volumes) so overlapping geoms are not counted twice when the link is
-    fully submerged. 'ignore' keeps the plain sum.
+    fully submerged. 'ignore' keeps the plain sum. The union fraction is
+    only estimated when needed or when report_overlap is set.
     """
     kinds, links, ids, roots, sizes = [], [], [], [], []
     volumes, centroids, rbounds, bvhs = [], [], [], []
@@ -406,10 +486,11 @@ def assemble_cob_geometry(geoms, n_links, overlap='ignore'):
     links = np.array(links, dtype=np.intc)
     volumes = np.array(volumes, dtype=float)
     link_overlap = np.ones(n_links)
-    for link_i in range(n_links):
-        link_geoms_i = [geom for geom in geoms if geom.link == link_i]
-        if len(link_geoms_i) > 1:
-            link_overlap[link_i] = estimate_overlap(link_geoms_i)
+    if overlap == 'scale' or report_overlap:
+        for link_i in range(n_links):
+            link_geoms_i = [geom for geom in geoms if geom.link == link_i]
+            if len(link_geoms_i) > 1:
+                link_overlap[link_i] = estimate_overlap(link_geoms_i)
     scale = np.ones(len(geoms))
     if overlap == 'scale':
         scale = link_overlap[links] if len(geoms) else scale

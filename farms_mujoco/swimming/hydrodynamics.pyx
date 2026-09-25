@@ -1,267 +1,51 @@
-"""hydrodynamics.pyx -- orchestration layer for swimming forces."""
+"""Hydrodynamics: buoyancy and drag on the links of an animat.
+
+SwimmingHandler.step() runs once per physics step. It is a single C loop
+over the fluid-interacting links which:
+
+1. evaluates the water surface at each link,
+2. computes the submerged volume and centre of buoyancy of every link
+   (cob.CobModel, reading the geom poses directly from MuJoCo),
+3. computes buoyancy and drag in the world frame,
+4. writes the wrench at the link CoM into MuJoCo's xfrc_applied and into
+   the xfrc sensor buffer (for logging and visualisation).
+"""
+
+# cython: boundscheck=False, wraparound=False, cdivision=True, language_level=3
 
 include 'types.pxd'
 
 import numpy as np
 cimport numpy as np
 
-from farms_core.sensors.data_cy cimport LinkSensorArrayCy, XfrcArrayCy
-from farms_core.utils.transform cimport quat_conj, quat_mult, quat_rot
+from farms_core.sensors.sensor_convention cimport (
+    LINK_COM_POSITION_X,
+    LINK_URDF_POSITION_X,
+    LINK_URDF_ORIENTATION_X,
+    LINK_COM_VELOCITY_LIN_X,
+    LINK_COM_VELOCITY_ANG_X,
+)
 
-from .drag cimport compute_link_drag_fast
-from .buoyancy_cy cimport compute_link_buoyancy_fast
+from .cob cimport CobModel
+from .cob_lut cimport CobLut
+from .drag cimport quadratic_drag, quadratic_drag_implicit
+from .ellipsoid_model cimport EllipsoidModel
+from .fluid_options import FluidOptions
 
-from .cob_options import CobOptions
+np.import_array()
 
-
-cdef void link_swimming_info(
-    LinkSensorArrayCy data_links,
-    unsigned int iteration,
-    int sensor_i,
-    DTYPEv1 urdf2global,
-    DTYPEv1 com2global,
-    DTYPEv1 global2urdf,
-    DTYPEv1 com2urdf,
-    DTYPEv1 urdf2com,
-    DTYPEv1 link_lin_velocity,
-    DTYPEv1 link_ang_velocity,
-    DTYPEv1 quat_c,
-    DTYPEv1 tmp4,
-):
-    """Link swimming information -- kinematic state shared by both the
-    drag and buoyancy computations for one link. Unchanged from the
-    original single-file drag.pyx."""
-    # Orientations
-    urdf2global[:] = data_links.urdf_orientation_cy(iteration, sensor_i)
-    com2global[:] = data_links.com_orientation_cy(iteration, sensor_i)
-    quat_conj(urdf2global, global2urdf)
-    quat_mult(global2urdf, com2global, com2urdf)
-    quat_conj(com2urdf, urdf2com)
-
-    # Compute velocity in CoM frame
-    quat_rot(
-        data_links.com_lin_velocity_cy(iteration, sensor_i),
-        global2urdf,
-        quat_c,
-        tmp4,
-        link_lin_velocity,
-    )
-    quat_rot(
-        data_links.com_ang_velocity_cy(iteration, sensor_i),
-        global2urdf,
-        quat_c,
-        tmp4,
-        link_ang_velocity,
-    )
+cdef enum:
+    COB_EXACT = 0
+    COB_LUT = 1
+    COB_RAMP = 2
 
 
-cdef bint compute_link_forces(
-        double time,
-        unsigned int iteration,
-        LinkSensorArrayCy data_links,
-        unsigned int links_index,
-        DTYPEv2 coefficients,
-        DTYPEv2 z3,
-        DTYPEv2 z4,
-        WaterProperties water,
-        double mass,
-        double bound_radius,
-        double density,
-        double gravity,
-        bint use_buoyancy,
-        object primitives,
-        bint use_exact_cob,
-        bint force_mesh,
-        DTYPEv1 force_out,
-        DTYPEv1 torque_out,
-):
-    """Pure computation: drag + buoyancy for one link, combined, in the
-    link's URDF frame. Writes into `force_out`/`torque_out` (already
-    caller-provided scratch, so no allocation).
-
-    Returns False if the link's bounding sphere is entirely above the
-    water surface (nothing to compute, force/torque left untouched) and
-    True otherwise.
-
-    `use_exact_cob` / `force_mesh` come from SwimmingHandler's
-    `cob_method` ('ramp' / 'mesh' / 'analytic', see CobOptions and
-    SwimmingHandler.__init__ below) -- resolved into two bints once at
-    setup time rather than compared as a string here, since this runs
-    every link every step.
-
-    This function itself now does almost no physics -- it gathers
-    kinematic state via link_swimming_info, delegates buoyancy to
-    buoyancy_cy.compute_link_buoyancy_fast and drag to
-    drag.compute_link_drag_fast, then combines and rotates the result
-    to world frame. All three cross-module calls are direct C calls
-    (cimported via .pxd), not Python calls.
-    """
-    cdef unsigned int i
-    urdf_pos = data_links.urdf_position_cy(iteration, links_index)
-    cdef double pos_x = urdf_pos[0]
-    cdef double pos_y = urdf_pos[1]
-    cdef double pos_z = urdf_pos[2]
-    cdef double surface = water.surface(time, pos_x, pos_y)
-
-    if pos_z - bound_radius > surface:
-        return False
-
-    cdef DTYPEv1 force=z3[0], torque=z3[1], buoyancy=z3[2], tmp=z3[3]
-    cdef DTYPEv1 link_lin_velocity=z3[4], link_ang_velocity=z3[5]
-    cdef DTYPEv1 fluid_velocity_urdf=z3[6]
-    cdef DTYPEv1 urdf2global=z4[0], com2global=z4[1]
-    cdef DTYPEv1 global2urdf=z4[2], urdf2com=z4[3], com2urdf=z4[4]
-    cdef DTYPEv1 quat_c=z4[5], tmp4=z4[6]
-
-    cdef DTYPEv1 pos_urdf=z3[7], com_position=z3[8]
-    cdef DTYPEv1 buoyancy_torque=z3[9]
-
-    link_swimming_info(
-        data_links=data_links,
-        iteration=iteration,
-        sensor_i=links_index,
-        urdf2global=urdf2global,
-        com2global=com2global,
-        global2urdf=global2urdf,
-        com2urdf=com2urdf,
-        urdf2com=urdf2com,
-        link_lin_velocity=link_lin_velocity,
-        link_ang_velocity=link_ang_velocity,
-        quat_c=quat_c,
-        tmp4=tmp4,
-    )
-
-    cdef double water_density = water.density(time, pos_x, pos_y, pos_z)
-
-    # com_position is only meaningful for the exact COB methods (torque
-    # is taken about it); only pay for the sensor lookup when it'll
-    # actually be used.
-    if use_buoyancy and use_exact_cob and primitives:
-        com_pos_sensor = data_links.com_position_cy(iteration, links_index)
-        com_position[0] = com_pos_sensor[0]
-        com_position[1] = com_pos_sensor[1]
-        com_position[2] = com_pos_sensor[2]
-
-    compute_link_buoyancy_fast(
-        use_buoyancy=use_buoyancy,
-        use_exact_cob=use_exact_cob,
-        force_mesh=force_mesh,
-        primitives=primitives,
-        density=density,
-        water_density=water_density,
-        bound_radius=bound_radius,
-        pos_x=pos_x,
-        pos_y=pos_y,
-        pos_z=pos_z,
-        global2urdf=global2urdf,
-        urdf2global=urdf2global,
-        mass=mass,
-        surface=surface,
-        gravity=gravity,
-        buoyancy=buoyancy,
-        buoyancy_torque=buoyancy_torque,
-        com_position=com_position,
-        pos_urdf=pos_urdf,
-        quat_c=quat_c,
-        tmp4=tmp4,
-        tmp=tmp,
-    )
-
-    compute_link_drag_fast(
-        force=force,
-        torque=torque,
-        link_lin_velocity=link_lin_velocity,
-        link_ang_velocity=link_ang_velocity,
-        fluid_velocity_world=water.velocity(time, pos_x, pos_y, pos_z),
-        global2urdf=global2urdf,
-        quat_c=quat_c,
-        tmp4=tmp4,
-        fluid_velocity_urdf=fluid_velocity_urdf,
-        coefficients=coefficients,
-        buoyancy=buoyancy,
-        viscosity=water.viscosity(time, pos_x, pos_y, pos_z),
-    )
-    for i in range(3):
-        torque[i] += buoyancy_torque[i]
-
-    # Rotate combined force/torque into world frame for the caller.
-    quat_rot(force, urdf2global, quat_c, tmp4, force_out)
-    quat_rot(torque, urdf2global, quat_c, tmp4, torque_out)
-
-    return True
-
-
-cpdef bint apply_swimming_forces(
-        double time,
-        unsigned int iteration,
-        LinkSensorArrayCy data_links,
-        unsigned int links_index,
-        XfrcArrayCy data_xfrc,
-        unsigned int xfrc_index,
-        DTYPEv2 coefficients,
-        DTYPEv2 z3,
-        DTYPEv2 z4,
-        WaterProperties water,
-        double mass,
-        double bound_radius,
-        double density,
-        double gravity,
-        bint use_buoyancy,
-        object primitives=None,
-        bint use_exact_cob=False,
-        bint force_mesh=False,
-):
-    """Compute this link's drag+buoyancy and write it into data_xfrc.
-
-    Renamed from drag_forces: the old name promised drag only, but it
-    also computed buoyancy and (as a side effect not implied by the
-    name at all) wrote directly into the xfrc sensor array. Call sites
-    used to do `apply_force = drag_forces(...)`, which read like
-    `apply_force` held a force vector -- it's actually the boolean this
-    function returns: whether the link was close enough to the water
-    surface for anything to have been computed and written.
-    """
-    cdef bint in_water
-
-    # z3 rows 0-9 are scratch used internally by compute_link_forces.
-    # force_out/torque_out need their own dedicated rows (10, 11).
-    cdef DTYPEv1 _force_out = z3[10]
-    cdef DTYPEv1 _torque_out = z3[11]
-
-    in_water = compute_link_forces(
-        time=time,
-        iteration=iteration,
-        data_links=data_links,
-        links_index=links_index,
-        coefficients=coefficients,
-        z3=z3,
-        z4=z4,
-        water=water,
-        mass=mass,
-        bound_radius=bound_radius,
-        density=density,
-        gravity=gravity,
-        use_buoyancy=use_buoyancy,
-        primitives=primitives,
-        use_exact_cob=use_exact_cob,
-        force_mesh=force_mesh,
-        force_out=_force_out,
-        torque_out=_torque_out,
-    )
-    if not in_water:
-        return False
-
-    cdef unsigned int i
-    for i in range(3):
-        data_xfrc.array[iteration, xfrc_index, i] = _force_out[i]
-        data_xfrc.array[iteration, xfrc_index, i+3] = _torque_out[i]
-    return True
-
+# ---------------------------------------------------------------------------
+# Water properties
+# ---------------------------------------------------------------------------
 
 cdef class WaterProperties:
-    """Water properties"""
-    def __init__(self):
-        super(WaterProperties, self).__init__()
+    """Water properties (base class: still water at z=0)"""
 
     cdef double surface(self, double t, double x, double y):
         return 0
@@ -269,26 +53,28 @@ cdef class WaterProperties:
     cdef double density(self, double t, double x, double y, double z):
         return 1000
 
-    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
-        return np.array([0, 0, 0])
+    cdef void velocity(self, double t, double x, double y, double z, double *out):
+        out[0] = 0
+        out[1] = 0
+        out[2] = 0
 
     cdef double viscosity(self, double t, double x, double y, double z):
         return 1.0
 
 
 cdef class WaterPropertiesConstant(WaterProperties):
-    """Water properties"""
-    cdef double _surface
+    """Uniform, time invariant water properties"""
+    cdef public double _surface
     cdef double _density
     cdef double _viscosity
-    cdef DTYPEv1 _velocity
+    cdef double _velocity[3]
 
     def __init__(self, surface, density, velocity, viscosity):
-        super(WaterPropertiesConstant, self).__init__()
+        super().__init__()
         self._surface = surface
         self._density = density
-        self._velocity = velocity
         self._viscosity = viscosity
+        self.set_velocity(0, velocity[0], velocity[1], velocity[2])
 
     cdef double surface(self, double t, double x, double y):
         return self._surface
@@ -296,27 +82,71 @@ cdef class WaterPropertiesConstant(WaterProperties):
     cdef double density(self, double t, double x, double y, double z):
         return self._density
 
-    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
-        return self._velocity
+    cdef void velocity(self, double t, double x, double y, double z, double *out):
+        out[0] = self._velocity[0]
+        out[1] = self._velocity[1]
+        out[2] = self._velocity[2]
 
     cdef double viscosity(self, double t, double x, double y, double z):
         return self._viscosity
 
     cpdef void set_velocity(self, double t, double vx, double vy, double vz):
+        """Set the water velocity"""
         self._velocity[0] = vx
         self._velocity[1] = vy
         self._velocity[2] = vz
 
 
+cdef class WaterPropertiesMaps(WaterPropertiesConstant):
+    """Constant surface, density and viscosity, with a horizontal water
+    velocity field given on a regular grid (nearest cell lookup)"""
+    cdef double[:, ::1] _vel_x
+    cdef double[:, ::1] _vel_y
+    cdef double _pos_min[2]
+    cdef double _pos_max[2]
+
+    def __init__(self, surface, density, viscosity, vel_x, vel_y, pos_min, pos_max):
+        super().__init__(surface, density, [0, 0, 0], viscosity)
+        self._vel_x = np.ascontiguousarray(vel_x, dtype=np.double)
+        self._vel_y = np.ascontiguousarray(vel_y, dtype=np.double)
+        for i in range(2):
+            self._pos_min[i] = pos_min[i]
+            self._pos_max[i] = pos_max[i]
+
+    cdef void velocity(self, double t, double x, double y, double z, double *out):
+        cdef int ix, iy
+        cdef double fx, fy
+        out[0] = 0
+        out[1] = 0
+        out[2] = 0
+        if not (self._pos_min[0] < x < self._pos_max[0]
+                and self._pos_min[1] < y < self._pos_max[1]):
+            return
+        fx = (x - self._pos_min[0])/(self._pos_max[0] - self._pos_min[0])
+        fy = (y - self._pos_min[1])/(self._pos_max[1] - self._pos_min[1])
+        ix = <int>(fx*self._vel_x.shape[0] + 0.5)
+        iy = <int>(fy*self._vel_x.shape[1] + 0.5)
+        ix = min(ix, self._vel_x.shape[0] - 1)
+        iy = min(iy, self._vel_x.shape[1] - 1)
+        out[0] = self._vel_x[ix, iy]
+        out[1] = self._vel_y[ix, iy]
+
+    def velocity_at(self, double x, double y):
+        """Python access for tests"""
+        cdef double out[3]
+        self.velocity(0, x, y, 0, out)
+        return np.array([out[0], out[1], out[2]])
+
+
 cdef class WaterPropertiesExtension(WaterProperties):
-    """Water properties"""
+    """Water properties given by Python callbacks (flexible but slow)"""
     cdef object _surface
     cdef object _density
     cdef object _viscosity
     cdef object _velocity
 
     def __init__(self, surface, density, velocity, viscosity):
-        super(WaterPropertiesExtension, self).__init__()
+        super().__init__()
         self._surface = surface
         self._density = density
         self._velocity = velocity
@@ -328,193 +158,331 @@ cdef class WaterPropertiesExtension(WaterProperties):
     cdef double density(self, double t, double x, double y, double z):
         return self._density(t, x, y, z)
 
-    cdef DTYPEv1 velocity(self, double t, double x, double y, double z):
-        return self._velocity(t, x, y, z)
+    cdef void velocity(self, double t, double x, double y, double z, double *out):
+        vel = self._velocity(t, x, y, z)
+        out[0] = vel[0]
+        out[1] = vel[1]
+        out[2] = vel[2]
 
     cdef double viscosity(self, double t, double x, double y, double z):
         return self._viscosity(t, x, y, z)
 
 
-cdef class SwimmingHandler:
-    """Swimming handler"""
-    cdef object links
-    cdef object xfrc
-    cdef object animat_options
-    cdef unsigned int n_links
-    cdef bint drag
-    cdef bint sph
-    cdef bint buoyancy
-    cdef bint use_exact_cob
-    cdef bint force_mesh
-    cdef bint use_interp_fast      # True when cob_method == 'analytic_fast'
-    cdef int   interp_steps        # steps between full recomputations
-    cdef object cob_method
-    cdef object link_primitives
-    cdef WaterProperties water
-    cdef double meters
-    cdef double newtons
-    cdef double torques
-    cdef int[:] links_swimming
-    cdef unsigned int[:] links_indices
-    cdef unsigned int[:] xfrc_indices
-    cdef DTYPEv1 masses
-    cdef DTYPEv1 bound_radii  # renamed from `heights` -- that's what it is
-    cdef DTYPEv1 densities
-    cdef DTYPEv2 z3
-    cdef DTYPEv2 z4
-    cdef DTYPEv3 links_coefficients
-    # analytic_fast interpolation state (one row per link)
-    cdef DTYPEv2 interp_cob_prev   # (n_links, 3) world-frame CoB at older anchor
-    cdef DTYPEv2 interp_cob_curr   # (n_links, 3) world-frame CoB at most-recent anchor
-    cdef DTYPEv2 interp_vol        # (n_links, 2): [prev_vol, curr_vol]
-    cdef np.ndarray interp_counter_arr  # (n_links,) int32 step counter
+# ---------------------------------------------------------------------------
+# Small vector helpers
+# ---------------------------------------------------------------------------
 
-    def __init__(self, data, animat_options, arena_options, units, physics, water=None, prefix=''):
-        super(SwimmingHandler, self).__init__()
-        self.animat_options = animat_options
-        self.links = data.sensors.links
-        self.xfrc = data.sensors.xfrc
+cdef inline void quat2mat(const double *q, double *R) noexcept nogil:
+    """Row-major rotation matrix from an (x, y, z, w) quaternion"""
+    cdef double x = q[0], y = q[1], z = q[2], w = q[3]
+    R[0] = 1 - 2*(y*y + z*z)
+    R[1] = 2*(x*y - z*w)
+    R[2] = 2*(x*z + y*w)
+    R[3] = 2*(x*y + z*w)
+    R[4] = 1 - 2*(x*x + z*z)
+    R[5] = 2*(y*z - x*w)
+    R[6] = 2*(x*z - y*w)
+    R[7] = 2*(y*z + x*w)
+    R[8] = 1 - 2*(x*x + y*y)
+
+
+cdef inline void mat_vec(const double *R, const double *v, double *out) noexcept nogil:
+    """out = R v"""
+    out[0] = R[0]*v[0] + R[1]*v[1] + R[2]*v[2]
+    out[1] = R[3]*v[0] + R[4]*v[1] + R[5]*v[2]
+    out[2] = R[6]*v[0] + R[7]*v[1] + R[8]*v[2]
+
+
+cdef inline void mat_t_vec(const double *R, const double *v, double *out) noexcept nogil:
+    """out = R^T v"""
+    out[0] = R[0]*v[0] + R[3]*v[1] + R[6]*v[2]
+    out[1] = R[1]*v[0] + R[4]*v[1] + R[7]*v[2]
+    out[2] = R[2]*v[0] + R[5]*v[1] + R[8]*v[2]
+
+
+cdef inline void cross(const double *a, const double *b, double *out) noexcept nogil:
+    """out = a x b"""
+    out[0] = a[1]*b[2] - a[2]*b[1]
+    out[1] = a[2]*b[0] - a[0]*b[2]
+    out[2] = a[0]*b[1] - a[1]*b[0]
+
+
+# ---------------------------------------------------------------------------
+# Handler
+# ---------------------------------------------------------------------------
+
+cdef class SwimmingHandler:
+    """Computes and applies the fluid forces on the links of an animat"""
+    cdef readonly object options
+    cdef readonly object cob_geometry
+    cdef WaterProperties water
+    cdef CobModel cob
+    cdef CobLut lut
+    cdef EllipsoidModel ellipsoid
+    cdef bint drag, buoyancy, drag_implicit, ellipsoid_drag
+    cdef int cob_method
+    cdef readonly int n_links
+    cdef double inv_meters, newtons, torques
+    cdef double gravity[3]
+    cdef int[::1] body_ids
+    cdef int[::1] links_indices
+    cdef int[::1] xfrc_indices
+    cdef double[::1] masses, densities, bound_radii
+    cdef double[:, :, ::1] coefficients
+    cdef double[::1] surfaces
+    cdef readonly double[:, ::1] submerged  # [V, V*c] per link (SI)
+    cdef DTYPEv3 links_array
+    cdef DTYPEv3 xfrc_array
+    cdef object _physics_arrays
+    cdef double[:, ::1] geom_xpos, geom_xmat, xpos, xmat, xfrc_applied
+
+    def __init__(self, data, animat_options, arena_options, units, physics,
+                 water=None, prefix=''):
+        super().__init__()
         water_options = arena_options.water
+        self.options = FluidOptions.from_water_options(water_options)
         self.drag = bool(water_options.drag)
-        self.sph = getattr(water_options, 'sph', False)
         self.buoyancy = bool(water_options.buoyancy)
-        self.meters = float(units.meters)
+        self.drag_implicit = self.options.drag_implicit
+        self.ellipsoid_drag = self.options.fluid_model == 'ellipsoid'
+        self.cob_method = {
+            'exact': COB_EXACT, 'lut': COB_LUT, 'ramp': COB_RAMP,
+        }[self.options.cob_method]
+        self.inv_meters = 1/float(units.meters)
         self.newtons = float(units.newtons)
         self.torques = float(units.torques)
+        gravity = np.array(physics.model.opt.gravity)/float(units.acceleration)
+        for i in range(3):
+            self.gravity[i] = gravity[i]
         self.water = WaterPropertiesConstant(
             surface=float(water_options.height),
             density=float(water_options.density),
-            velocity=np.array(water_options.velocity, dtype=float),
+            velocity=np.array(water_options.velocity[:3], dtype=float),
             viscosity=float(water_options.viscosity),
         ) if water is None else water
+        if getattr(water_options, 'sph', False):
+            self.water._surface = 1e8
 
-        # z3 grew by one row (12 instead of 11) for apply_swimming_forces'
-        # dedicated torque_out scratch.
-        self.z3 = np.zeros([12, 3])
-        self.z4 = np.zeros([7, 4])
-
-        # --- Center-of-buoyancy method + mesh resolution ---
-        # See cob_options.py's module docstring for the config-file
-        # shapes this reads (flat `cob_*` fields on water_options, or a
-        # nested `cob` block -- both work, nested takes priority).
-        # Resolved once here into the two bints compute_link_forces
-        # actually branches on every link every step, so that hot path
-        # never does a string comparison.
-
-
-        print("WATER OPTIONS:")
-        print(water_options)
-        print("cob_method:", getattr(water_options, "cob_method", "MISSING"))
-        print("cob_cylinder_n_seg:", getattr(water_options, "cob_cylinder_n_seg", "MISSING"))
-
-
-        cob_options = CobOptions.from_water_options(water_options)
-
-        print("COB OPTIONS:")
-        print(cob_options)
-        print("method:", cob_options.method)
-        print("cylinder n_seg:", cob_options.cylinder_n_seg)
-
-        self.cob_method      = cob_options.method
-        self.use_exact_cob   = self.cob_method not in ('ramp',)
-        self.force_mesh      = self.cob_method == 'mesh'
-        self.use_interp_fast = self.cob_method == 'analytic_fast'
-        self.interp_steps    = cob_options.interp_steps
-        mesh_resolution = cob_options.to_mesh_resolution()
-
+        # Links
         links = [
-            link
-            for link in self.animat_options.morphology.links
+            link for link in animat_options.morphology.links
             if link.fluid_interaction
         ]
         self.n_links = len(links)
-        links_row = physics.named.model.body_mass.axes.row
-        self.masses = np.array([
-            physics.model.body_mass[links_row.convert_key_item(prefix+link.name)]
-            for link in links
-        ], dtype=float)/units.kilograms
-
-        self.bound_radii = np.array([
-            max(
-                float(np.linalg.norm(physics.model.geom_pos[geom_i]))
-                + physics.model.geom_rbound[geom_i]  # already a radius, not a diameter -- do not halve
-                for geom_i in range(len(physics.model.geom_bodyid))
-                if links_row.names[physics.named.model.geom_bodyid[geom_i]]
-                == prefix+link.name
-                and physics.model.geom_group[geom_i] == 2
-            )
-            for link in links
-        ], dtype=float)/self.meters
-
-        self.densities = np.array([link.density for link in links])
-        self.xfrc_indices = np.array([
-            self.xfrc.names.index(link.name)
-            for link in links
-        ], dtype=np.uintc)
+        model = physics.model
+        self.body_ids = np.array([
+            model.name2id(prefix + link.name, 'body') for link in links
+        ], dtype=np.intc)
+        sensors = data.sensors
         self.links_indices = np.array([
-            self.links.names.index(link.name)
-            for link in links
-        ], dtype=np.uintc)
-        self.links_coefficients = np.array([
-            np.array(link.drag_coefficients)
-            for link in links
-        ])
+            sensors.links.names.index(link.name) for link in links
+        ], dtype=np.intc)
+        self.xfrc_indices = np.array([
+            sensors.xfrc.names.index(link.name) for link in links
+        ], dtype=np.intc)
+        self.links_array = sensors.links.array
+        self.xfrc_array = sensors.xfrc.array
+        self.masses = np.array([
+            model.body_mass[body_id] for body_id in self.body_ids
+        ], dtype=float)/float(units.kilograms)
+        self.densities = np.array([link.density for link in links], dtype=float)
+        self.coefficients = np.ascontiguousarray([
+            np.reshape(link.drag_coefficients, [2, 3]) for link in links
+        ], dtype=float).reshape(-1, 2, 3)
+        self.bound_radii = np.array([
+            max([
+                np.linalg.norm(model.geom_pos[geom_i]) + model.geom_rbound[geom_i]
+                for geom_i in np.flatnonzero(model.geom_bodyid == body_id)
+                if model.geom_group[geom_i] == self.options.cob_geom_group
+            ] or [0.0])
+            for body_id in self.body_ids
+        ], dtype=float)*self.inv_meters
+        self.surfaces = np.zeros(self.n_links)
+        self.submerged = np.zeros([self.n_links, 4])
 
-        # Per-link collision-primitive caches, needed by both the
-        # 'mesh' and 'analytic' cob_methods (analytic still needs the
-        # cache per primitive to know its geom_type/geom_size, even
-        # when it skips the mesh itself -- see PrimitiveCache in
-        # primitive_meshes.py).
-        if self.use_exact_cob:
-            from .geom_utils import gather_link_collision_primitives
-            self.link_primitives = [
-                gather_link_collision_primitives(
-                    physics=physics,
-                    link_name=link.name,
-                    prefix=prefix,
-                    meters=self.meters,
-                    mesh_resolution=mesh_resolution,
-                )
-                for link in links
-            ]
-        else:
-            self.link_primitives = [None]*self.n_links
+        # Buoyancy geometry
+        if self.cob_method == COB_EXACT or self.ellipsoid_drag:
+            from .cob_build import build_cob_geometry
+            self.cob_geometry = build_cob_geometry(
+                model=model,
+                body_ids=np.asarray(self.body_ids),
+                geom_group=self.options.cob_geom_group,
+                meters=float(units.meters),
+                overlap=self.options.cob_overlap,
+            )
+            self.cob = CobModel(self.cob_geometry)
+        if self.cob_method == COB_LUT:
+            from .cob_lut_build import build_cob_lut
+            self.lut = build_cob_lut(
+                model=model,
+                body_ids=np.asarray(self.body_ids),
+                geom_group=self.options.cob_geom_group,
+                meters=float(units.meters),
+                resolution=self.options.cob_lut_resolution,
+            )
+        if self.ellipsoid_drag:
+            from .ellipsoid_model import build_ellipsoid_model
+            self.ellipsoid = build_ellipsoid_model(
+                handler_geometry=self.cob_geometry,
+                model=model,
+                body_ids=np.asarray(self.body_ids),
+                options=self.options,
+                meters=float(units.meters),
+                kilograms=float(units.kilograms),
+            )
 
-        # Per-link analytic_fast interpolation state.
-        # Initialised to zero; the first call is always an anchor step
-        # (counter == 0) so the very first simulation step is exact.
-        self.interp_cob_prev    = np.zeros((self.n_links, 3), dtype=float)
-        self.interp_cob_curr    = np.zeros((self.n_links, 3), dtype=float)
-        self.interp_vol         = np.zeros((self.n_links, 2), dtype=float)
-        self.interp_counter_arr = np.zeros(self.n_links, dtype=np.intc)
+        # MuJoCo state (views on the MjData buffers)
+        data_mj = physics.data
+        self._physics_arrays = (
+            data_mj.geom_xpos, data_mj.geom_xmat, data_mj.xpos, data_mj.xmat,
+            data_mj.xfrc_applied,
+        )
+        self.geom_xpos = data_mj.geom_xpos
+        self.geom_xmat = data_mj.geom_xmat
+        self.xpos = data_mj.xpos
+        self.xmat = data_mj.xmat
+        self.xfrc_applied = data_mj.xfrc_applied
 
-        if self.sph:
-            self.water._surface = 1e8
+    cpdef void step(self, double time, unsigned int iteration, double timestep=0):
+        """Compute and apply the fluid forces for this physics step"""
+        cdef int li, s_i, i
+        cdef double x, y, z
+        if not (self.drag or self.buoyancy) or self.n_links == 0:
+            return
 
-    cpdef step(self, double time, unsigned int iteration, double timestep=0):
-        """Swimming step"""
-        cdef unsigned int i
+        # Water surface at each link
+        for li in range(self.n_links):
+            s_i = self.links_indices[li]
+            x = self.links_array[iteration, s_i, LINK_URDF_POSITION_X]
+            y = self.links_array[iteration, s_i, LINK_URDF_POSITION_X+1]
+            self.surfaces[li] = self.water.surface(time, x, y)
+
+        # Submerged volume and centre of buoyancy of every link
+        if self.cob_method == COB_EXACT or self.ellipsoid_drag:
+            self.cob.compute(
+                &self.geom_xpos[0, 0], &self.geom_xmat[0, 0],
+                self.inv_meters, &self.surfaces[0], &self.submerged[0, 0],
+            )
+        if self.cob_method == COB_LUT:
+            self.lut.compute(
+                &self.xpos[0, 0], &self.xmat[0, 0], self.inv_meters,
+                &self.surfaces[0], &self.submerged[0, 0],
+            )
+
+        for li in range(self.n_links):
+            self.link_forces(li, time, iteration, timestep)
+
+    cdef void link_forces(self, int li, double time, unsigned int iteration,
+                          double timestep):
+        """Fluid wrench on one link, written to xfrc_applied and sensors"""
+        cdef int s_i = self.links_indices[li], x_i = self.xfrc_indices[li]
+        cdef int body = self.body_ids[li], i
+        cdef double *state = &self.links_array[iteration, s_i, 0]
+        cdef double *pos = state + LINK_URDF_POSITION_X
+        cdef double *com = state + LINK_COM_POSITION_X
+        cdef double surface = self.surfaces[li]
+        cdef double volume = 0, fraction, density, viscosity, ramp
+        cdef double force[3]
+        cdef double torque[3]
+        cdef double buoyancy[3]
+        cdef double arm[3]
+        cdef double tmp[3]
+        cdef double tmp2[3]
+        cdef double vel[3]
+        cdef double R[9]
         cdef bint in_water
-        if self.drag or self.sph or self.buoyancy:
-            for i in range(self.n_links):
-                if self.drag or self.buoyancy:
-                    in_water = apply_swimming_forces(
-                        time=time,
-                        iteration=iteration,
-                        data_links=self.links,
-                        links_index=self.links_indices[i],
-                        data_xfrc=self.xfrc,
-                        xfrc_index=self.xfrc_indices[i],
-                        coefficients=self.links_coefficients[i],
-                        z3=self.z3,
-                        z4=self.z4,
-                        water=self.water,
-                        mass=self.masses[i],
-                        bound_radius=self.bound_radii[i],
-                        density=self.densities[i],
-                        gravity=-9.81,
-                        use_buoyancy=self.buoyancy,
-                        primitives=self.link_primitives[i],
-                        use_exact_cob=self.use_exact_cob,
-                        force_mesh=self.force_mesh,
+
+        # Is the link interacting with the water
+        if self.cob_method == COB_RAMP:
+            in_water = pos[2] - self.bound_radii[li] <= surface
+        else:
+            volume = self.submerged[li, 0]
+            in_water = volume > 0
+        if not in_water:
+            for i in range(6):
+                self.xfrc_array[iteration, x_i, i] = 0
+                self.xfrc_applied[body, i] = 0
+            return
+
+        density = self.water.density(time, pos[0], pos[1], pos[2])
+        for i in range(3):
+            force[i] = 0
+            torque[i] = 0
+            buoyancy[i] = 0
+
+        # Buoyancy: -rho*V*g applied at the centre of buoyancy
+        if self.buoyancy:
+            if self.cob_method == COB_RAMP:
+                if self.masses[li] > 0:
+                    ramp = (surface + self.bound_radii[li] - pos[2])/(
+                        2*self.bound_radii[li]
                     )
+                    ramp = 1 if ramp > 1 else ramp
+                    for i in range(3):
+                        buoyancy[i] = (
+                            -density*self.masses[li]*self.gravity[i]
+                            /self.densities[li]*ramp
+                        )
+            else:
+                for i in range(3):
+                    buoyancy[i] = -density*volume*self.gravity[i]
+                    arm[i] = self.submerged[li, i+1]/volume - com[i]
+                cross(arm, buoyancy, torque)
+            for i in range(3):
+                force[i] = buoyancy[i]
+
+        # Drag
+        if self.drag:
+            self.water.velocity(time, pos[0], pos[1], pos[2], vel)
+            for i in range(3):
+                vel[i] = state[LINK_COM_VELOCITY_LIN_X+i] - vel[i]
+            if self.ellipsoid_drag:
+                fraction = volume/self.ellipsoid.link_volume[li]
+                viscosity = self.water.viscosity(time, pos[0], pos[1], pos[2])
+                self.ellipsoid.wrench(
+                    li, &self.xmat[body, 0], vel,
+                    state + LINK_COM_VELOCITY_ANG_X,
+                    density, viscosity, fraction, tmp, tmp2,
+                )
+                for i in range(3):
+                    force[i] += tmp[i]
+                    torque[i] += tmp2[i]
+            else:
+                quat2mat(state + LINK_URDF_ORIENTATION_X, R)
+                viscosity = self.water.viscosity(time, pos[0], pos[1], pos[2])
+                mat_t_vec(R, vel, tmp)  # Relative velocity in link frame
+                if self.drag_implicit:
+                    mat_t_vec(R, buoyancy, arm)
+                    quadratic_drag_implicit(
+                        tmp, &self.coefficients[li, 0, 0], viscosity,
+                        self.masses[li], timestep, arm, tmp2,
+                    )
+                else:
+                    quadratic_drag(
+                        tmp, &self.coefficients[li, 0, 0], viscosity, tmp2,
+                    )
+                mat_vec(R, tmp2, tmp)
+                for i in range(3):
+                    force[i] += tmp[i]
+                mat_t_vec(R, state + LINK_COM_VELOCITY_ANG_X, tmp)
+                quadratic_drag(tmp, &self.coefficients[li, 1, 0], 1.0, tmp2)
+                mat_vec(R, tmp2, tmp)
+                for i in range(3):
+                    torque[i] += tmp[i]
+
+        # Apply at the CoM, in the world frame
+        for i in range(3):
+            self.xfrc_array[iteration, x_i, i] = force[i]
+            self.xfrc_array[iteration, x_i, i+3] = torque[i]
+            self.xfrc_applied[body, i] = force[i]*self.newtons
+            self.xfrc_applied[body, i+3] = torque[i]*self.torques
+
+    cpdef void set_water_velocity(self, DTYPEv1 velocity):
+        """Set water velocity (constant water properties only)"""
+        (<WaterPropertiesConstant>self.water).set_velocity(
+            0, velocity[0], velocity[1], velocity[2],
+        )
+
+    def links_submerged(self):
+        """Last computed [V, V*c] per link (SI units)"""
+        return np.asarray(self.submerged)

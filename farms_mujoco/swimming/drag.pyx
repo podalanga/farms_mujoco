@@ -1,88 +1,47 @@
-"""drag.pyx -- drag physics only."""
+"""Drag force kernels.
 
-from farms_core.utils.transform cimport quat_rot
+Per-axis quadratic drag in a link frame, F_i = scale*c_i*v_i*|v_i|, where
+the coefficients c_i are negative (drag opposes the motion) and scale is
+the fluid viscosity for forces or 1 for torques.
+"""
+
+# cython: boundscheck=False, wraparound=False, cdivision=True, language_level=3
+
+from libc.math cimport fabs, sqrt
 
 
-cdef void compute_drag_force(
-    DTYPEv1 force,
-    DTYPEv1 link_velocity,
-    DTYPEv1 coefficients,
-    DTYPEv1 buoyancy,
-    double viscosity,
-):
-    """Quadratic drag force (URDF frame) plus buoyancy already summed in.
-    Renamed from compute_force: this is drag, with buoyancy folded in as
-    the last step -- the old name gave no hint either force was involved.
-    """
-    cdef unsigned int i
+cdef void quadratic_drag(
+    const double *velocity, const double *coefficients, double scale,
+    double *out,
+) noexcept nogil:
+    """Explicit per-axis quadratic drag"""
+    cdef int i
     for i in range(3):
-        force[i] = link_velocity[i]*link_velocity[i]
-        if link_velocity[i] < 0:
-            force[i] *= -1
-        force[i] *= viscosity*coefficients[i]
-        force[i] += buoyancy[i]
+        out[i] = scale*coefficients[i]*velocity[i]*fabs(velocity[i])
 
 
-cdef void compute_drag_torque(
-    DTYPEv1 torque,
-    DTYPEv1 link_ang_velocity,
-    DTYPEv1 coefficients,
-):
-    """Quadratic drag torque (URDF frame). Renamed from compute_torque
-    for the same reason as compute_drag_force above."""
-    cdef unsigned int i
-    for i in range(3):
-        torque[i] = link_ang_velocity[i]*link_ang_velocity[i]
-        if link_ang_velocity[i] < 0:
-            torque[i] *= -1
-        torque[i] *= coefficients[i]
+cdef void quadratic_drag_implicit(
+    const double *velocity, const double *coefficients, double scale,
+    double mass, double dt, const double *other, double *out,
+) noexcept nogil:
+    """Semi-implicit (backward Euler) per-axis quadratic drag.
 
-
-cdef void compute_link_drag_fast(
-    DTYPEv1 force,
-    DTYPEv1 torque,
-    DTYPEv1 link_lin_velocity,
-    DTYPEv1 link_ang_velocity,
-    DTYPEv1 fluid_velocity_world,
-    DTYPEv1 global2urdf,
-    DTYPEv1 quat_c,
-    DTYPEv1 tmp4,
-    DTYPEv1 fluid_velocity_urdf,
-    DTYPEv2 coefficients,
-    DTYPEv1 buoyancy,
-    double viscosity,
-):
-    """Combined per-link drag entry point, called once per link per step
-    by hydrodynamics.compute_link_forces.
-
-    Rotates the ambient fluid velocity into the link's URDF frame,
-    subtracts it from the link's own velocity (drag depends on the
-    RELATIVE velocity between link and fluid, not the link's absolute
-    velocity), then computes drag force (with buoyancy folded in --
-    see compute_drag_force) and drag torque.
-
-    Mutates `link_lin_velocity` in place (becomes the relative
-    velocity) -- same as the original inline code did; the caller's
-    copy of it is scratch, not needed again after this call.
-
-    `coefficients` is the link's (2, 3) drag-coefficient array:
-    coefficients[0] = linear (force) coefficients, coefficients[1] =
-    angular (torque) coefficients -- unchanged convention.
+    Solves m*(v' - v)/dt = -c*v'*|v'| + f per axis for the end-of-step
+    velocity v', with c = -scale*coefficient >= 0 and f the other fluid
+    forces on that axis, and returns the drag -c*v'*|v'|. Unconditionally
+    stable for large timesteps, falls back to explicit drag otherwise.
     """
-    quat_rot(fluid_velocity_world, global2urdf, quat_c, tmp4, fluid_velocity_urdf)
-    link_lin_velocity[0] -= fluid_velocity_urdf[0]
-    link_lin_velocity[1] -= fluid_velocity_urdf[1]
-    link_lin_velocity[2] -= fluid_velocity_urdf[2]
-
-    compute_drag_force(
-        force=force,
-        link_velocity=link_lin_velocity,
-        coefficients=coefficients[0],
-        buoyancy=buoyancy,
-        viscosity=viscosity,
-    )
-    compute_drag_torque(
-        torque=torque,
-        link_ang_velocity=link_ang_velocity,
-        coefficients=coefficients[1],
-    )
+    cdef int i
+    cdef double c, a, b, v_new
+    for i in range(3):
+        c = -scale*coefficients[i]
+        if c > 0 and mass > 0 and dt > 0:
+            a = mass/dt
+            b = a*velocity[i] + other[i]
+            if b >= 0:
+                v_new = 2*b/(a + sqrt(a*a + 4*c*b))
+            else:
+                v_new = 2*b/(a + sqrt(a*a - 4*c*b))
+            out[i] = -c*v_new*fabs(v_new)
+        else:
+            out[i] = scale*coefficients[i]*velocity[i]*fabs(velocity[i])
