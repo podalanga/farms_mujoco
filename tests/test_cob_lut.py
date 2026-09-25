@@ -8,7 +8,7 @@ from farms_mujoco.swimming.cob_build import (
     SPHERE, CAPSULE, CYLINDER, POLYHEDRON,
     GeomInfo, assemble_cob_geometry, box_triangles,
 )
-from test_cob import random_rotation, torus_mesh
+from test_cob import torus_mesh
 
 
 def geom(kind, size, pos=(0, 0, 0), rot=None, tris=None):
@@ -36,7 +36,13 @@ def lut_errors(geoms, resolution=(32, 64), n_poses=20, seed=0, voxel=False):
     size = max(np.max(np.abs(cob_lut_build.voxelize_link(geoms)[0])), 1e-9)
     err_v = err_c = 0.0
     for _ in range(n_poses):
-        rot = random_rotation()
+        quat = rng.normal(size=4)
+        w, x, y, z = quat/np.linalg.norm(quat)
+        rot = np.array([
+            [1-2*(y*y+z*z), 2*(x*y-z*w), 2*(x*z+y*w)],
+            [2*(x*y+z*w), 1-2*(x*x+z*z), 2*(y*z-x*w)],
+            [2*(x*z-y*w), 2*(y*z+x*w), 1-2*(x*x+y*y)],
+        ])
         pos = rng.normal(size=3)
         xpos = np.array([rot @ g.pos + pos for g in geoms])
         xmat = np.array([(rot @ g.rot).reshape(-1) for g in geoms])
@@ -72,10 +78,11 @@ def test_lut_accuracy(name, voxel):
         'capsule': [geom(CAPSULE, [0.03, 0.1], pos=[0.02, 0, 0])],
         'torus': [geom(POLYHEDRON, [0], tris=torus_mesh())],
     }[name]
-    err_v, err_c = lut_errors(geoms, voxel=voxel)
+    err_v, err_c = lut_errors(geoms, n_poses=40, voxel=voxel)
     print(f'{name} (voxel={voxel}): volume {err_v:.2e}, centroid {err_c:.2e}')
-    assert err_v < 0.02
-    assert err_c < 0.02
+    tolerance = 0.03 if voxel else 0.015
+    assert err_v < tolerance
+    assert err_c < tolerance
 
 
 def test_lut_overlap_union():

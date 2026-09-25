@@ -29,7 +29,7 @@ from farms_core.sensors.sensor_convention cimport (
 from .cob cimport CobModel
 from .cob_lut cimport CobLut
 from .drag cimport quadratic_drag, quadratic_drag_implicit
-from .ellipsoid_model cimport EllipsoidModel
+from .ellipsoid_model cimport EllipsoidModel, ADDED_MASS_IMPLICIT
 from .fluid_options import FluidOptions
 
 np.import_array()
@@ -219,10 +219,11 @@ cdef class SwimmingHandler:
     cdef CobModel cob
     cdef CobLut lut
     cdef EllipsoidModel ellipsoid
-    cdef bint drag, buoyancy, drag_implicit, ellipsoid_drag
+    cdef bint drag, buoyancy, drag_implicit, ellipsoid_drag, use_exact
+    cdef bint implicit_added_mass
     cdef int cob_method
     cdef readonly int n_links
-    cdef double inv_meters, newtons, torques
+    cdef double inv_meters, newtons, torques, kilograms, inertia_unit
     cdef double gravity[3]
     cdef int[::1] body_ids
     cdef int[::1] links_indices
@@ -230,6 +231,9 @@ cdef class SwimmingHandler:
     cdef double[::1] masses, densities, bound_radii
     cdef double[:, :, ::1] coefficients
     cdef double[::1] surfaces
+    cdef readonly double[::1] full_volume   # Full buoyant volume per link
+    cdef double[::1] body_mass, body_mass0
+    cdef double[:, ::1] body_inertia, body_inertia0, inertia_added
     cdef readonly double[:, ::1] submerged  # [V, V*c] per link (SI)
     cdef DTYPEv3 links_array
     cdef DTYPEv3 xfrc_array
@@ -249,6 +253,8 @@ cdef class SwimmingHandler:
             'exact': COB_EXACT, 'lut': COB_LUT, 'ramp': COB_RAMP,
         }[self.options.cob_method]
         self.inv_meters = 1/float(units.meters)
+        self.kilograms = float(units.kilograms)
+        self.inertia_unit = self.kilograms*float(units.meters)**2
         self.newtons = float(units.newtons)
         self.torques = float(units.torques)
         gravity = np.array(physics.model.opt.gravity)/float(units.acceleration)
@@ -282,6 +288,17 @@ cdef class SwimmingHandler:
         ], dtype=np.intc)
         self.links_array = sensors.links.array
         self.xfrc_array = sensors.xfrc.array
+        # Original body masses and inertias (the implicit added mass
+        # modifies them, and handlers are rebuilt at every episode)
+        if not hasattr(physics, '_farms_body_mass0'):
+            physics._farms_body_mass0 = np.array(model.body_mass)
+            physics._farms_body_inertia0 = np.array(model.body_inertia)
+        self.body_mass0 = physics._farms_body_mass0
+        self.body_inertia0 = physics._farms_body_inertia0
+        model.body_mass[:] = physics._farms_body_mass0
+        model.body_inertia[:] = physics._farms_body_inertia0
+        self.body_mass = model.body_mass
+        self.body_inertia = model.body_inertia
         self.masses = np.array([
             model.body_mass[body_id] for body_id in self.body_ids
         ], dtype=float)/float(units.kilograms)
@@ -301,7 +318,10 @@ cdef class SwimmingHandler:
         self.submerged = np.zeros([self.n_links, 4])
 
         # Buoyancy geometry
-        if self.cob_method == COB_EXACT or self.ellipsoid_drag:
+        self.use_exact = self.cob_method == COB_EXACT or (
+            self.ellipsoid_drag and self.cob_method == COB_RAMP
+        )
+        if self.use_exact:
             from .cob_build import build_cob_geometry
             self.cob_geometry = build_cob_geometry(
                 model=model,
@@ -311,6 +331,7 @@ cdef class SwimmingHandler:
                 overlap=self.options.cob_overlap,
             )
             self.cob = CobModel(self.cob_geometry)
+            self.full_volume = np.array(self.cob_geometry.link_volume, dtype=float)
         if self.cob_method == COB_LUT:
             from .cob_lut_build import build_cob_lut
             self.lut = build_cob_lut(
@@ -320,15 +341,24 @@ cdef class SwimmingHandler:
                 meters=float(units.meters),
                 resolution=self.options.cob_lut_resolution,
             )
+            self.full_volume = np.array(self.lut.volume, dtype=float)
         if self.ellipsoid_drag:
-            from .ellipsoid_model import build_ellipsoid_model
+            from .ellipsoid_model import (
+                build_ellipsoid_model, implicit_added_inertia,
+            )
             self.ellipsoid = build_ellipsoid_model(
-                handler_geometry=self.cob_geometry,
                 model=model,
                 body_ids=np.asarray(self.body_ids),
                 options=self.options,
                 meters=float(units.meters),
                 kilograms=float(units.kilograms),
+                water_density=float(water_options.density),
+            )
+            self.implicit_added_mass = (
+                self.ellipsoid.added_mass == ADDED_MASS_IMPLICIT
+            )
+            self.inertia_added = implicit_added_inertia(
+                self.ellipsoid, model, np.asarray(self.body_ids),
             )
 
         # MuJoCo state (views on the MjData buffers)
@@ -358,7 +388,7 @@ cdef class SwimmingHandler:
             self.surfaces[li] = self.water.surface(time, x, y)
 
         # Submerged volume and centre of buoyancy of every link
-        if self.cob_method == COB_EXACT or self.ellipsoid_drag:
+        if self.use_exact:
             self.cob.compute(
                 &self.geom_xpos[0, 0], &self.geom_xmat[0, 0],
                 self.inv_meters, &self.surfaces[0], &self.submerged[0, 0],
@@ -402,6 +432,8 @@ cdef class SwimmingHandler:
             for i in range(6):
                 self.xfrc_array[iteration, x_i, i] = 0
                 self.xfrc_applied[body, i] = 0
+            if self.implicit_added_mass:
+                self.set_added_mass(li, 0, 0)
             return
 
         density = self.water.density(time, pos[0], pos[1], pos[2])
@@ -437,16 +469,27 @@ cdef class SwimmingHandler:
             for i in range(3):
                 vel[i] = state[LINK_COM_VELOCITY_LIN_X+i] - vel[i]
             if self.ellipsoid_drag:
-                fraction = volume/self.ellipsoid.link_volume[li]
+                volume = self.submerged[li, 0]
+                fraction = (
+                    volume/self.full_volume[li] if self.full_volume[li] > 0 else 0
+                )
+                fraction = 1 if fraction > 1 else fraction
                 viscosity = self.water.viscosity(time, pos[0], pos[1], pos[2])
+                for i in range(3):
+                    arm[i] = self.xpos[body, i]*self.inv_meters
                 self.ellipsoid.wrench(
-                    li, &self.xmat[body, 0], vel,
+                    li, &self.xmat[body, 0], arm, com, vel,
                     state + LINK_COM_VELOCITY_ANG_X,
-                    density, viscosity, fraction, tmp, tmp2,
+                    density, viscosity, fraction, timestep, tmp, tmp2,
                 )
                 for i in range(3):
                     force[i] += tmp[i]
                     torque[i] += tmp2[i]
+                if self.implicit_added_mass:
+                    ramp = self.set_added_mass(li, fraction, density)
+                    # The added mass must not weigh: cancel its gravity
+                    for i in range(3):
+                        force[i] -= ramp*self.gravity[i]
             else:
                 quat2mat(state + LINK_URDF_ORIENTATION_X, R)
                 viscosity = self.water.viscosity(time, pos[0], pos[1], pos[2])
@@ -476,6 +519,25 @@ cdef class SwimmingHandler:
             self.xfrc_array[iteration, x_i, i+3] = torque[i]
             self.xfrc_applied[body, i] = force[i]*self.newtons
             self.xfrc_applied[body, i+3] = torque[i]*self.torques
+
+    cdef double set_added_mass(self, int li, double fraction, double density):
+        """Implicit added mass (Stonefish style): add the mean translational
+        added mass and the diagonal added inertia (scaled by the submerged
+        fraction) to the body. Returns the added mass [kg]."""
+        cdef int body = self.body_ids[li], i
+        cdef double added = 0
+        if fraction > 0:
+            added = fraction*density*(
+                self.ellipsoid.mass_added[li, 0]
+                + self.ellipsoid.mass_added[li, 1]
+                + self.ellipsoid.mass_added[li, 2]
+            )/3
+        self.body_mass[body] = self.body_mass0[body] + added*self.kilograms
+        for i in range(3):
+            self.body_inertia[body, i] = self.body_inertia0[body, i] + (
+                fraction*density*self.inertia_added[li, i]*self.inertia_unit
+            )
+        return added
 
     cpdef void set_water_velocity(self, DTYPEv1 velocity):
         """Set water velocity (constant water properties only)"""

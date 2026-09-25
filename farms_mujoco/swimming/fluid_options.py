@@ -14,7 +14,8 @@ priority), e.g.:
       drag_implicit: false     # semi-implicit quadratic drag
       fluid_model: legacy      # legacy | ellipsoid
       ellipsoid_fit: mvee      # mvee | inertia
-      ellipsoid_coefficients: [1.0, 1.0, 1.0]  # [form, viscous, rotational]
+      ellipsoid_coefficients: [1.0, 1.0, 2.5]  # [form, viscous, rotational]
+      dynamic_viscosity: 1.0e-3  # [Pa.s] for the ellipsoid viscous drag
       added_mass: off          # off | explicit | implicit
 
 cob_method:
@@ -62,7 +63,8 @@ class FluidOptions:
     drag_implicit: bool = False
     fluid_model: str = 'legacy'
     ellipsoid_fit: str = 'mvee'
-    ellipsoid_coefficients: list = field(default_factory=lambda: [1.0, 1.0, 1.0])
+    ellipsoid_coefficients: list = field(default_factory=lambda: [1.0, 1.0, 2.5])
+    dynamic_viscosity: float = 1.0e-3
     added_mass: str = 'off'
 
     def __post_init__(self):
@@ -76,6 +78,7 @@ class FluidOptions:
         _check('added_mass', self.added_mass, ADDED_MASS)
         self.cob_geom_group = int(self.cob_geom_group)
         self.cob_lut_resolution = [int(n) for n in self.cob_lut_resolution]
+        self.dynamic_viscosity = float(self.dynamic_viscosity)
         self.ellipsoid_coefficients = [
             float(c) for c in self.ellipsoid_coefficients
         ]
