@@ -491,7 +491,7 @@ cdef class SwimmingHandler:
         if self.sph:
             self.water._surface = 1e8
 
-    cpdef step(self, double time, unsigned int iteration):
+    cpdef step(self, double time, unsigned int iteration, double timestep=0):
         """Swimming step"""
         cdef unsigned int i
         cdef bint in_water
