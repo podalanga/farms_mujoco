@@ -26,13 +26,17 @@ cob_method:
   the union of the link's geoms, O(1) per link and overlap-free.
 - ramp: legacy bounding-sphere ramp based on the link mass and density.
 
-The legacy values 'analytic', 'analytic_fast' and 'mesh' map to 'exact'.
+The legacy values 'analytic', 'analytical', 'analytic_fast' and 'mesh' map
+to 'exact'.
 """
 
 from dataclasses import dataclass, field
 
 COB_METHODS = ('exact', 'lut', 'ramp')
-COB_ALIASES = {'analytic': 'exact', 'analytic_fast': 'exact', 'mesh': 'exact'}
+COB_ALIASES = {
+    'analytic': 'exact', 'analytical': 'exact', 'analytic_fast': 'exact',
+    'mesh': 'exact',
+}
 FLUID_MODELS = ('legacy', 'ellipsoid')
 ELLIPSOID_FITS = ('mvee', 'inertia')
 ADDED_MASS = ('off', 'explicit', 'implicit')
