@@ -71,7 +71,15 @@ and the first moment for an octahedral grid of water directions and
 depths. They are sampled with the exact kernels, or from a voxelisation of
 the union of the geoms when they overlap, so overlapping geoms are only
 counted once. Errors are about 1% of the link volume. The tables are cached
-in memory and in `~/.cache/farms_mujoco/cob_lut`.
+in memory and on disk, by default in `cob_lut_cache/` next to the running
+script (e.g. `experiments/<name>/cob_lut_cache/` for
+`experiments/<name>/run_sim.py`), so they travel with the experiment and
+persist through mounted Docker volumes. `cob_lut_cache: <dir>` or the
+`FARMS_COB_LUT_CACHE` environment variable choose another directory, and
+`cob_lut_cache: false` disables the disk cache. If the directory is not
+writable (e.g. a read-only volume), the tables go to
+`~/.cache/farms_mujoco/cob_lut`, then to the temporary directory, with a
+warning. Writes are atomic, so parallel processes can share one cache.
 
 Overlapping collision geoms are counted twice by `exact`
 (`cob_overlap: ignore`, as before). `cob_overlap: scale` rescales them by

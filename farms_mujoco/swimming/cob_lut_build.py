@@ -14,11 +14,15 @@ for symmetric shapes).
   direction the voxel projections are binned and prefix-summed, each
   voxel spreading uniformly over its projected width.
 
-Tables are cached in memory and on disk (~/.cache/farms_mujoco/cob_lut)
-by geometry hash, so episode resets and new processes reuse them.
+Tables are cached in memory and on disk by geometry hash, so episode
+resets and new processes reuse them. The disk cache lives next to the
+running script (e.g. experiments/<name>/cob_lut_cache), see cache_dirs().
 """
 
 import os
+import sys
+import tempfile
+import warnings
 
 import numpy as np
 
@@ -31,11 +35,112 @@ from .cob_build import (
 from .cob_lut import CobLut
 
 LUT_VERSION = 2
-CACHE_DIR = os.path.join(
-    os.environ.get('XDG_CACHE_HOME', os.path.expanduser('~/.cache')),
-    'farms_mujoco', 'cob_lut',
-)
+CACHE_ENV = 'FARMS_COB_LUT_CACHE'
+CACHE_DIRNAME = 'cob_lut_cache'
 _CACHE = {}
+_WARNED = set()
+
+
+# Disk cache location
+# ---------------------------------------------------------------------------
+
+def _script_dir():
+    """Directory of the running script, or the working directory
+
+    `python -m` modules (e.g. the macOS mjpython re-exec of farms_sim) and
+    console scripts (inside the environment, sys.prefix) use the working
+    directory instead.
+    """
+    main = sys.modules.get('__main__')
+    script = getattr(main, '__file__', None)
+    if script and getattr(main, '__spec__', None) is None:
+        script_dir = os.path.dirname(os.path.realpath(script))
+        prefixes = {os.path.realpath(p) for p in (sys.prefix, sys.base_prefix)}
+        if not any(
+                os.path.commonpath([script_dir, prefix]) == prefix
+                for prefix in prefixes
+        ):
+            return script_dir
+    return os.getcwd()
+
+
+def _user_cache_dir():
+    """$XDG_CACHE_HOME or ~/.cache, None without a home (e.g. Docker --user)"""
+    base = os.environ.get('XDG_CACHE_HOME')
+    if not base:
+        home = os.path.expanduser('~')
+        base = os.path.join(home, '.cache') if home != '~' else None
+    return os.path.join(base, 'farms_mujoco', 'cob_lut') if base else None
+
+
+def cache_dirs(cache=None):
+    """Disk cache directories, in order of preference
+
+    cache: None for the default, False to disable the disk cache, or a
+    directory (relative paths are relative to the running script).
+    Default: $FARMS_COB_LUT_CACHE if set, else <script dir>/cob_lut_cache,
+    e.g. experiments/<name>/cob_lut_cache for experiments/<name>/run_sim.py.
+    The user cache and the temporary directory follow as fallbacks for
+    read-only locations (e.g. a read-only Docker volume).
+    """
+    if cache is False:
+        return []
+    if cache is None or cache is True:
+        cache = os.environ.get(CACHE_ENV) or CACHE_DIRNAME
+    cache = os.path.expanduser(str(cache))
+    if not os.path.isabs(cache):
+        cache = os.path.join(_script_dir(), cache)
+    dirs = []
+    for directory in (
+            cache, _user_cache_dir(),
+            os.path.join(tempfile.gettempdir(), 'farms_mujoco_cob_lut'),
+    ):
+        if directory and os.path.abspath(directory) not in dirs:
+            dirs.append(os.path.abspath(directory))
+    return dirs
+
+
+def _load(dirs, key):
+    """Cached LUT from the first directory holding a valid file"""
+    for directory in dirs:
+        path = os.path.join(directory, f'{key}.npz')
+        if not os.path.isfile(path):
+            continue
+        try:
+            with np.load(path) as data:
+                return (
+                    data['table'], data['t_range'], float(data['volume']),
+                    data['centroid'],
+                )
+        except (OSError, KeyError, ValueError, EOFError):
+            continue
+    return None
+
+
+def _save(dirs, key, lut):
+    """Atomic write (safe across parallel processes) to the first writable dir"""
+    for directory in dirs:
+        path = os.path.join(directory, f'{key}.npz')
+        tmp = f'{path}.{os.getpid()}.tmp.npz'
+        try:
+            os.makedirs(directory, exist_ok=True)
+            np.savez(tmp, table=lut[0], t_range=lut[1], volume=lut[2], centroid=lut[3])
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            continue
+        if directory != dirs[0] and dirs[0] not in _WARNED:
+            _WARNED.add(dirs[0])
+            warnings.warn(
+                f'CoB LUT cache {dirs[0]} is not writable, using {directory}'
+                f' instead (set {CACHE_ENV} or cob_lut_cache to choose)',
+                stacklevel=3,
+            )
+        return path
+    return None
 
 
 def oct_decode(u, v):
@@ -236,8 +341,12 @@ def _build_link_lut(geoms, n_dir, n_depth, voxels, overlap_tolerance):
 
 
 def build_link_lut(geoms, resolution=(32, 64), voxels=96, overlap_tolerance=1e-3,
-                   disk_cache=True):
-    """(table, t_range, volume, centroid) for one link, cached by geometry"""
+                   disk_cache=True, cache_dir=None):
+    """(table, t_range, volume, centroid) for one link, cached by geometry
+
+    disk_cache: False keeps the tables in memory only.
+    cache_dir: disk cache directory, see cache_dirs().
+    """
     n_dir, n_depth = resolution
     if not geoms:
         return (
@@ -250,38 +359,23 @@ def build_link_lut(geoms, resolution=(32, 64), voxels=96, overlap_tolerance=1e-3
     )
     if key in _CACHE:
         return _CACHE[key]
-    path = os.path.join(CACHE_DIR, f'{key}.npz')
-    if disk_cache and os.path.isfile(path):
-        try:
-            data = np.load(path)
-            _CACHE[key] = (
-                data['table'], data['t_range'], float(data['volume']),
-                data['centroid'],
-            )
-            return _CACHE[key]
-        except (OSError, KeyError, ValueError):
-            pass
-    lut = _build_link_lut(geoms, n_dir, n_depth, voxels, overlap_tolerance)
+    dirs = cache_dirs(cache_dir if disk_cache else False)
+    lut = _load(dirs, key)
+    if lut is None:
+        lut = _build_link_lut(geoms, n_dir, n_depth, voxels, overlap_tolerance)
+        _save(dirs, key, lut)
     _CACHE[key] = lut
-    if disk_cache:
-        try:
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            tmp = f'{path}.{os.getpid()}.tmp.npz'
-            np.savez(tmp, table=lut[0], t_range=lut[1], volume=lut[2], centroid=lut[3])
-            os.replace(tmp, path)
-        except OSError:
-            pass
     return lut
 
 
 def build_cob_lut(model, body_ids, geom_group=2, meters=1.0,
-                  resolution=(32, 64), voxels=96):
+                  resolution=(32, 64), voxels=96, cache_dir=None):
     """CobLut for the given MuJoCo bodies"""
     geoms = link_geoms(model, body_ids, geom_group=geom_group, meters=meters)
     luts = [
         build_link_lut(
             [geom for geom in geoms if geom.link == link_i],
-            resolution=resolution, voxels=voxels,
+            resolution=resolution, voxels=voxels, cache_dir=cache_dir,
         )
         for link_i in range(len(body_ids))
     ]

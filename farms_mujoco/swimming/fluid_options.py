@@ -11,6 +11,7 @@ priority), e.g.:
       cob_geom_group: 2        # 2: collision geoms, 1: visual geoms
       cob_overlap: ignore      # ignore | scale (union of overlapping geoms)
       cob_lut_resolution: [32, 64]  # [directions per side, depths]
+      cob_lut_cache: null      # LUT disk cache dir, see below
       drag_implicit: false     # semi-implicit quadratic drag
       fluid_model: legacy      # legacy | ellipsoid
       ellipsoid_fit: mvee      # mvee | inertia
@@ -25,6 +26,14 @@ cob_method:
 - lut: per-link lookup table built at load time from a voxelisation of
   the union of the link's geoms, O(1) per link and overlap-free.
 - ramp: legacy bounding-sphere ramp based on the link mass and density.
+
+cob_lut_cache (lut only): directory of the on-disk table cache.
+- null: $FARMS_COB_LUT_CACHE if set, else cob_lut_cache/ next to the
+  running script (e.g. experiments/<name>/cob_lut_cache).
+- a path: relative paths are relative to the running script.
+- false: no disk cache (tables are rebuilt in every process).
+Unwritable locations fall back to ~/.cache/farms_mujoco/cob_lut, then to
+the temporary directory.
 
 The legacy values 'analytic', 'analytical', 'analytic_fast' and 'mesh' map
 to 'exact'.
@@ -64,6 +73,7 @@ class FluidOptions:
     cob_geom_group: int = 2
     cob_overlap: str = 'ignore'
     cob_lut_resolution: list = field(default_factory=lambda: [32, 64])
+    cob_lut_cache: object = None
     drag_implicit: bool = False
     fluid_model: str = 'legacy'
     ellipsoid_fit: str = 'mvee'

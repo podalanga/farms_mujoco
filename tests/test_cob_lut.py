@@ -1,5 +1,7 @@
 """Accuracy tests for the centre-of-buoyancy lookup tables (cob_lut.pyx)"""
 
+import os
+
 import numpy as np
 import pytest
 
@@ -108,3 +110,46 @@ def test_lut_link_with_cylinder_and_box():
     assert volume == pytest.approx(
         exact.link_volume[0]*exact.link_overlap[0], rel=0.05,
     )
+
+
+def test_lut_disk_cache_next_to_script(tmp_path, monkeypatch):
+    """Default cache is cob_lut_cache/ next to the running script"""
+    script = tmp_path / 'experiment' / 'run_sim.py'
+    script.parent.mkdir()
+    script.write_text('')
+    monkeypatch.delenv(cob_lut_build.CACHE_ENV, raising=False)
+    main = cob_lut_build.sys.modules['__main__']
+    monkeypatch.setattr(main, '__file__', str(script), raising=False)
+    monkeypatch.setattr(main, '__spec__', None, raising=False)
+    dirs = cob_lut_build.cache_dirs()
+    assert dirs[0] == str(script.parent / cob_lut_build.CACHE_DIRNAME)
+    assert cob_lut_build.cache_dirs('luts')[0] == str(script.parent / 'luts')
+    assert cob_lut_build.cache_dirs(False) == []
+    # `python -m` runs (spec set) use the working directory
+    monkeypatch.setattr(main, '__spec__', object())
+    monkeypatch.chdir(tmp_path)
+    assert cob_lut_build.cache_dirs()[0] == str(tmp_path / cob_lut_build.CACHE_DIRNAME)
+    monkeypatch.setenv(cob_lut_build.CACHE_ENV, str(tmp_path / 'env'))
+    assert cob_lut_build.cache_dirs()[0] == str(tmp_path / 'env')
+
+
+def test_lut_disk_cache_roundtrip_and_fallback(tmp_path, monkeypatch):
+    """Tables are written once, reloaded, and fall back when read-only"""
+    geoms = [geom(SPHERE, [0.1])]
+    monkeypatch.setattr(cob_lut_build, '_CACHE', {})
+    lut = cob_lut_build.build_link_lut(geoms, resolution=(8, 16), cache_dir=tmp_path / 'a')
+    files = list((tmp_path / 'a').glob('*.npz'))
+    assert len(files) == 1 and not list((tmp_path / 'a').glob('*.tmp.npz'))
+    monkeypatch.setattr(cob_lut_build, '_CACHE', {})
+    monkeypatch.setattr(cob_lut_build, '_build_link_lut', None)  # must not rebuild
+    loaded = cob_lut_build.build_link_lut(geoms, resolution=(8, 16), cache_dir=tmp_path / 'a')
+    assert np.array_equal(loaded[0], lut[0])
+    # Read-only primary directory: next writable fallback is used
+    monkeypatch.setattr(cob_lut_build, 'cache_dirs', lambda cache: [
+        str(tmp_path / 'ro' / 'x'), str(tmp_path / 'b')])
+    (tmp_path / 'ro').mkdir(mode=0o500)
+    if os.access(tmp_path / 'ro', os.W_OK):  # root ignores permissions
+        pytest.skip('directory permissions not enforced')
+    with pytest.warns(UserWarning, match='not writable'):
+        path = cob_lut_build._save(cob_lut_build.cache_dirs(None), 'key', lut)
+    assert path == str(tmp_path / 'b' / 'key.npz')

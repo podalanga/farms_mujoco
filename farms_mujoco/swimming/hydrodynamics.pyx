@@ -340,6 +340,7 @@ cdef class SwimmingHandler:
                 geom_group=self.options.cob_geom_group,
                 meters=float(units.meters),
                 resolution=self.options.cob_lut_resolution,
+                cache_dir=self.options.cob_lut_cache,
             )
             self.full_volume = np.array(self.lut.volume, dtype=float)
         if self.ellipsoid_drag:
