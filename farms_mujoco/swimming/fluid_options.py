@@ -29,7 +29,7 @@ cob_method:
 
 cob_lut_cache (lut only): directory of the on-disk table cache.
 - null: $FARMS_COB_LUT_CACHE if set, else cob_lut_cache/ next to the
-  running script (e.g. experiments/<name>/cob_lut_cache).
+  running script (e.g. `experiments/<name>/cob_lut_cache`).
 - a path: relative paths are relative to the running script.
 - false: no disk cache (tables are rebuilt in every process).
 Unwritable locations fall back to ~/.cache/farms_mujoco/cob_lut, then to

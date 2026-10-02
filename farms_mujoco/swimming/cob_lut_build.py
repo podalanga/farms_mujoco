@@ -16,7 +16,7 @@ for symmetric shapes).
 
 Tables are cached in memory and on disk by geometry hash, so episode
 resets and new processes reuse them. The disk cache lives next to the
-running script (e.g. experiments/<name>/cob_lut_cache), see cache_dirs().
+running script (e.g. `experiments/<name>/cob_lut_cache`), see cache_dirs().
 """
 
 import os
@@ -78,8 +78,8 @@ def cache_dirs(cache=None):
 
     cache: None for the default, False to disable the disk cache, or a
     directory (relative paths are relative to the running script).
-    Default: $FARMS_COB_LUT_CACHE if set, else <script dir>/cob_lut_cache,
-    e.g. experiments/<name>/cob_lut_cache for experiments/<name>/run_sim.py.
+    Default: `$FARMS_COB_LUT_CACHE` if set, else `<script dir>/cob_lut_cache`,
+    e.g. `experiments/<name>/cob_lut_cache` for `experiments/<name>/run_sim.py`.
     The user cache and the temporary directory follow as fallbacks for
     read-only locations (e.g. a read-only Docker volume).
     """
@@ -101,19 +101,27 @@ def cache_dirs(cache=None):
 
 
 def _load(dirs, key):
-    """Cached LUT from the first directory holding a valid file"""
-    for directory in dirs:
+    """Cached LUT from the first directory holding a valid file
+
+    A table found in a fallback directory (e.g. the user cache of an older
+    version) is also copied to the preferred one, so that each experiment
+    folder ends up with its own tables.
+    """
+    for index, directory in enumerate(dirs):
         path = os.path.join(directory, f'{key}.npz')
         if not os.path.isfile(path):
             continue
         try:
             with np.load(path) as data:
-                return (
+                lut = (
                     data['table'], data['t_range'], float(data['volume']),
                     data['centroid'],
                 )
         except (OSError, KeyError, ValueError, EOFError):
             continue
+        if index > 0:
+            _save(dirs[:1], key, lut)
+        return lut
     return None
 
 

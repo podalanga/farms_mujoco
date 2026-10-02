@@ -153,3 +153,16 @@ def test_lut_disk_cache_roundtrip_and_fallback(tmp_path, monkeypatch):
     with pytest.warns(UserWarning, match='not writable'):
         path = cob_lut_build._save(cob_lut_build.cache_dirs(None), 'key', lut)
     assert path == str(tmp_path / 'b' / 'key.npz')
+
+
+def test_lut_disk_cache_copies_fallback(tmp_path, monkeypatch):
+    """A table found in a fallback directory is copied to the preferred one"""
+    geoms = [geom(SPHERE, [0.1])]
+    monkeypatch.setattr(cob_lut_build, '_CACHE', {})
+    cob_lut_build.build_link_lut(geoms, resolution=(8, 16), cache_dir=tmp_path / 'old')
+    monkeypatch.setattr(cob_lut_build, '_CACHE', {})
+    monkeypatch.setattr(cob_lut_build, '_build_link_lut', None)  # must not rebuild
+    monkeypatch.setattr(cob_lut_build, 'cache_dirs', lambda cache: [
+        str(tmp_path / 'new'), str(tmp_path / 'old')])
+    cob_lut_build.build_link_lut(geoms, resolution=(8, 16))
+    assert len(list((tmp_path / 'new').glob('*.npz'))) == 1
